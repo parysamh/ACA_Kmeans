@@ -8,6 +8,9 @@
 #include <limits>
 #include <algorithm>
 #include <filesystem>
+#include <numeric>
+#include <random>
+#include <algorithm>
 
 using std::cout; using std::cin; using std::endl;
 using std::vector;
@@ -24,31 +27,20 @@ inline double sqdist2(const double* P, const double* C) {
 }
 
 // k-means++ initialization on rank 0
-static vector<double> kmeans_pp_init(const vector<double>& all_points, int N, int K, std::mt19937& gen) {
-    vector<double> centroids(K * DIM);
-    std::uniform_int_distribution<> pick0(0, N - 1);
-    int first = pick0(gen);
-    centroids[0*DIM+0] = all_points[first*DIM+0];
-    centroids[0*DIM+1] = all_points[first*DIM+1];
+static std::vector<double> random_init_centroids(const std::vector<double>& all_points, int N, int K) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
 
-    vector<double> d2(N, 0.0);
+    // build [0..N-1], shuffle, take first K indices
+    std::vector<int> idx(N);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::shuffle(idx.begin(), idx.end(), gen);
 
-    for (int c = 1; c < K; ++c) {
-        double total = 0.0;
-        for (int i = 0; i < N; ++i) {
-            double mind2 = std::numeric_limits<double>::infinity();
-            for (int cc = 0; cc < c; ++cc) {
-                mind2 = std::min(mind2, sqdist2(&all_points[i*DIM], &centroids[cc*DIM]));
-            }
-            d2[i] = mind2;
-            total += mind2;
-        }
-        std::uniform_real_distribution<double> prob(0.0, total);
-        double r = prob(gen), cum = 0.0;
-        int chosen = 0;
-        for (int i = 0; i < N; ++i) { cum += d2[i]; if (cum >= r) { chosen = i; break; } }
-        centroids[c*DIM+0] = all_points[chosen*DIM+0];
-        centroids[c*DIM+1] = all_points[chosen*DIM+1];
+    std::vector<double> centroids(K * DIM);
+    for (int c = 0; c < K; ++c) {
+        int i = idx[c];
+        centroids[c*DIM + 0] = all_points[i*DIM + 0];
+        centroids[c*DIM + 1] = all_points[i*DIM + 1];
     }
     return centroids;
 }
@@ -122,9 +114,7 @@ int main(int argc, char** argv) {
     // Initialize centroids on rank 0 (k-means++) and broadcast
     vector<double> centroids(K * DIM);
     if (rank == 0) {
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        centroids = kmeans_pp_init(all_points, N, K, gen);
+        centroids = random_init_centroids(all_points, N, K);
     }
     MPI_Bcast(centroids.data(), K * DIM, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
