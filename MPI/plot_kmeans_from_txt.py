@@ -43,7 +43,7 @@ for cluster_id, points in points_by_cluster.items():
 # Plot centroids
 for cluster_id, (cx, cy) in centroids.items():
     color = colors[cluster_id % len(colors)]
-    plt.scatter(cx, cy, marker='X', s=200, edgecolors='black', color=color, label=f"Centroid {cluster_id}")
+    plt.scatter(cx, cy, marker='X', s=200, edgecolors='black', color=color)
 
 # Format plot
 plt.title("K-Means Clustering Visualization")

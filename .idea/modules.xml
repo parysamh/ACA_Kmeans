@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/Project2.iml" filepath="$PROJECT_DIR$/.idea/Project2.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/ACA_Kmeans.iml" filepath="$PROJECT_DIR$/.idea/ACA_Kmeans.iml" />
     </modules>
   </component>
 </project>
