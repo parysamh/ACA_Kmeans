@@ -1,57 +1,107 @@
-import matplotlib.pyplot as plt
 import re
+import argparse
+from pathlib import Path
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D)
 
-# Read clustering_result.txt
-with open("clustering_result.txt", "r") as file:
-    lines = file.readlines()
+# Matches: Cluster N : (c1, c2, ..., cD) --> (p1...), (p2...), ... [then next Cluster...]
+CLUSTER_BLOCK = re.compile(
+    r"Cluster\s+(\d+)\s*:\s*\(([^)]*)\)\s*-->\s*(.*?)(?=(?:\s*Cluster\s+\d+\s*:)|\Z)",
+    re.DOTALL
+)
 
-points_by_cluster = {}
-centroids = {}
+def parse_file(path: Path):
+    text = path.read_text().strip()
+    clusters = {}     # id -> list of points (tuples)
+    centroids = {}    # id -> centroid tuple
+    detected_dim = None
 
-# Parse each line
-for line in lines:
-    line = line.strip()
-    match = re.match(r"Cluster (\d+) : \(([^,]+), ([^)\s]+)\) ---> (.+)", line)
-    if match:
-        cluster_id = int(match.group(1))
-        centroid_x = float(match.group(2))
-        centroid_y = float(match.group(3))
-        point_section = match.group(4)
+    for m in CLUSTER_BLOCK.finditer(text):
+        cid = int(m.group(1))
+        cstr = m.group(2).strip()
+        pstr = m.group(3).strip()
 
-        # Store centroid
-        centroids[cluster_id] = (centroid_x, centroid_y)
+        c_vals = tuple(float(x.strip()) for x in cstr.split(","))
+        centroids[cid] = c_vals
+        if detected_dim is None:
+            detected_dim = len(c_vals)
 
-        # Find all points
-        points = []
-        for pt in re.findall(r"Point \(([^,]+), ([^)]+)\)", point_section):
-            x = float(pt[0])
-            y = float(pt[1])
-            points.append((x, y))
+        pts = []
+        for grp in re.findall(r"\(([^)]*)\)", pstr):
+            parts = [p.strip() for p in grp.split(",")]
+            try:
+                vals = tuple(float(p) for p in parts)
+                pts.append(vals)
+            except ValueError:
+                pass
+        clusters[cid] = pts
 
-        points_by_cluster[cluster_id] = points
+    return clusters, centroids, detected_dim
 
-# Set up plot
-plt.figure(figsize=(8, 6))
-colors = ['red', 'green', 'blue', 'orange', 'purple', 'brown', 'cyan', 'magenta']
+def main():
+    ap = argparse.ArgumentParser(description="3D plot of clustered points with centroids (same color).")
+    ap.add_argument("--file", "-f", default="clustering_result.txt", help="Path to output file")
+    ap.add_argument("--xi", type=int, default=0, help="x-axis dim index (0-based)")
+    ap.add_argument("--yi", type=int, default=1, help="y-axis dim index (0-based)")
+    ap.add_argument("--zi", type=int, default=2, help="z-axis dim index (0-based)")
+    ap.add_argument("--limit", type=int, default=0, help="plot first N points per cluster (0=all)")
+    ap.add_argument("--elev", type=float, default=20.0, help="elevation angle")
+    ap.add_argument("--azim", type=float, default=-60.0, help="azimuth angle")
+    ap.add_argument("--save", type=str, default="", help="optional path to save PNG instead of showing")
+    args = ap.parse_args()
 
-# Plot points by cluster
-for cluster_id, points in points_by_cluster.items():
-    xs, ys = zip(*points)
-    color = colors[cluster_id % len(colors)]
-    plt.scatter(xs, ys, label=f"Cluster {cluster_id}", color=color, s=50)
+    path = Path(args.file)
+    if not path.exists():
+        print(f"File not found: {path}")
+        return
 
-# Plot centroids
-for cluster_id, (cx, cy) in centroids.items():
-    color = colors[cluster_id % len(colors)]
-    plt.scatter(cx, cy, marker='X', s=200, edgecolors='black', color=color)
+    clusters, centroids, D = parse_file(path)
+    if not clusters:
+        print("No clusters parsed. Check file format.")
+        return
 
-# Format plot
-plt.title("K-Means Clustering Visualization")
-plt.xlabel("X")
-plt.ylabel("Y")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
+    need = max(args.xi, args.yi, args.zi)
+    if D is None or need >= D:
+        print(f"Chosen axes out of range. Detected DIM={D}, requested indices: {args.xi},{args.yi},{args.zi}.")
+        return
 
-# Show plot
-plt.show()
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Stable color map: cluster id -> color
+    palette = plt.rcParams['axes.prop_cycle'].by_key().get('color', []) or [f"C{i}" for i in range(10)]
+    ccolor = {cid: palette[i % len(palette)] for i, cid in enumerate(sorted(clusters.keys()))}
+
+    # Plot clusters
+    for cid in sorted(clusters.keys()):
+        pts = clusters[cid]
+        if args.limit > 0:
+            pts = pts[:args.limit]
+        col = ccolor[cid]
+        if pts:
+            xs = [p[args.xi] for p in pts]
+            ys = [p[args.yi] for p in pts]
+            zs = [p[args.zi] for p in pts]
+            ax.scatter(xs, ys, zs, s=12, alpha=0.9, label=f"Cluster {cid}", color=col, depthshade=True)
+
+        c = centroids.get(cid)
+        if c:
+            ax.scatter(c[args.xi], c[args.yi], c[args.zi],
+                       marker='X', s=180, color=col,
+                       edgecolors='black', linewidths=1.0, depthshade=False)
+
+    ax.set_title(f"K-Means Clusters 3D (DIM={D}) — x=dim{args.xi}, y=dim{args.yi}, z=dim{args.zi}")
+    ax.set_xlabel(f"dim {args.xi}")
+    ax.set_ylabel(f"dim {args.yi}")
+    ax.set_zlabel(f"dim {args.zi}")
+    ax.view_init(elev=args.elev, azim=args.azim)
+    ax.legend(loc="best", fontsize=9)
+    plt.tight_layout()
+
+    if args.save:
+        plt.savefig(args.save, dpi=150)
+    else:
+        plt.show()
+
+if __name__ == "__main__":
+    main()
