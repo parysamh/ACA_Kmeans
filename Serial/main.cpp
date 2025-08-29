@@ -1,479 +1,773 @@
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <random>
-#include <iomanip>
-#include <fstream>
-#include <chrono>
-#include <limits>
+// Serial K-Means Variants: Lloyd, Elkan, Hamerly, Yinyang (file-driven, dimension-agnostic)
+// Reads points from a semicolon-separated file "household_power_consumption.txt"
+// placed in the PARENT directory of this source file. Uses ANY number of chosen columns as features.
+// The program ALWAYS asks the user which variant to run; K and columns come from CLI.
+//
+// ---------------------------------------------------------------
+// Build:
+//   g++ -std=gnu++17 -O3 -march=native -o kmeans_serial kmeans_serial.cpp
+//
+// Run examples:
+//   ./kmeans_serial --k=5 --cols=GAP,V --limit=200000
+//   ./kmeans_serial --k=6 --cols=GI,SM1,SM2                  # 3D features
+//   ./kmeans_serial --k=6 --cols=GAP,GRP,V,GI,SM1,SM2,SM3    # 7D (default)
+//
+// Args:
+//   --k=<int>            number of clusters (required; >0)
+//   --cols=C1[,C2,...]   one or more columns as features (default: GAP,GRP,V,GI,SM1,SM2,SM3)
+//                        from {GAP,GRP,V,GI,SM1,SM2,SM3}
+//                          GAP=Global_active_power, GRP=Global_reactive_power,
+//                          V=Voltage, GI=Global_intensity, SM*=Sub_metering_*
+//   --limit=<int>        cap maximum rows loaded (optional)
+//
+// Notes:
+// - Dimension (DIM) is determined at runtime from the number of columns in --cols.
+// - If --cols is omitted, defaults to all 7 features.
+// - File path: parent_path(__FILE__) / "household_power_consumption.txt".
+// - Output: clustering_result.txt in current working directory.
+// - Educational implementation; production can add k-means++, SIMD, OpenMP, etc.
+// ---------------------------------------------------------------
+
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-using namespace std;
+#include <chrono>
+using clk = std::chrono::high_resolution_clock;
+using secd = std::chrono::duration<double>;
 
-static constexpr int DIM = 2;
+using std::cin;
+using std::cout;
+using std::endl;
+using std::string;
+using std::vector;
 
-// ---------------- Utilities ----------------
-inline float sqdist2(const float* a, const float* b) {
-    float dx = a[0] - b[0];
-    float dy = a[1] - b[1];
-    return dx*dx + dy*dy;
+namespace fs = std::filesystem;
+
+// -------------------------- Utilities --------------------------
+
+static inline void trim_inplace(std::string& s) {
+  size_t a = s.find_first_not_of(" \t\r");
+  if (a == std::string::npos) {
+    s.clear();
+    return;
+  }
+  size_t b = s.find_last_not_of(" \t\r");
+  s = s.substr(a, b - a + 1);
 }
-inline float l2(const float* a, const float* b) {
-    return std::sqrt(sqdist2(a, b));
+
+// Global runtime dimension (set after parsing --cols)
+static int gDIM = 2;
+
+// -------------------------- Math --------------------------
+
+inline double sqdist2(const double* p, const double* c) {
+  double s = 0.0;
+  for (int d = 0; d < gDIM; ++d) {
+    double dx = p[d] - c[d];
+    s += dx * dx;
+  }
+  return s;
 }
 
-// ---------------- Lloyd assignment ----------------
-static void assign_lloyd(
-    const vector<vector<float>>& points,
-    const vector<vector<float>>& C,
-    int K,
-    vector<int>& labels,
-    vector<vector<float>>& sum,
-    vector<int>& cnt
-) {
-    const int N = (int)points.size();
-    for (int i = 0; i < N; ++i) {
-        float best = std::numeric_limits<float>::infinity();
-        int bestc = 0;
-        for (int c = 0; c < K; ++c) {
-            float d2 = sqdist2(points[i].data(), C[c].data());
-            if (d2 < best) { best = d2; bestc = c; }
-        }
-        labels[i] = bestc;
-        sum[bestc][0] += points[i][0];
-        sum[bestc][1] += points[i][1];
-        cnt[bestc] += 1;
+inline double l2(const double* a, const double* b) {
+  return std::sqrt(sqdist2(a, b));
+}
+
+// --------------- Center Separation (Elkan / Hamerly) ---------------
+
+static void compute_center_separation(const vector<double>& C, int K, vector<double>& s) {
+  s.assign(K, std::numeric_limits<double>::infinity());
+  for (int c = 0; c < K; ++c) {
+    double best = std::numeric_limits<double>::infinity();
+    for (int j = 0; j < K; ++j) {
+      if (j == c) continue;
+      double d = l2(&C[c * (size_t)gDIM], &C[j * (size_t)gDIM]);
+      if (d < best) best = d;
     }
+    s[c] = 0.5 * best;
+  }
 }
 
-// ---------------- Center helpers ----------------
-static void compute_center_separation(
-    const vector<vector<float>>& C, int K, vector<float>& s // s[c] = 0.5 * min_{j!=c} d(Cc,Cj)
-) {
-    s.assign(K, std::numeric_limits<float>::infinity());
-    if (K <= 1) { s[0] = std::numeric_limits<float>::infinity(); return; }
+static void compute_center_dists(const vector<double>& C, int K, vector<double>& Dcc) {
+  Dcc.assign((size_t)K * (size_t)K, 0.0);
+  for (int i = 0; i < K; ++i) {
+    for (int j = i + 1; j < K; ++j) {
+      double d = l2(&C[i * (size_t)gDIM], &C[j * (size_t)gDIM]);
+      Dcc[i * (size_t)K + j] = Dcc[j * (size_t)K + i] = d;
+    }
+  }
+}
+
+// -------------------------- Lloyd --------------------------
+
+static void assign_lloyd(const vector<double>& P,
+                         const vector<double>& C,
+                         int K,
+                         vector<int>& label,
+                         vector<double>& sum,
+                         vector<int>& cnt) {
+  const int n = (int)label.size();
+  std::fill(sum.begin(), sum.end(), 0.0);
+  std::fill(cnt.begin(), cnt.end(), 0);
+
+  for (int i = 0; i < n; ++i) {
+    double best = std::numeric_limits<double>::infinity();
+    int bestc = 0;
+    const double* pi = &P[i * (size_t)gDIM];
+
     for (int c = 0; c < K; ++c) {
-        float best = std::numeric_limits<float>::infinity();
-        for (int j = 0; j < K; ++j) if (j != c) {
-            float d = l2(C[c].data(), C[j].data());
-            if (d < best) best = d;
-        }
-        s[c] = 0.5f * best;
+      double d2 = sqdist2(pi, &C[c * (size_t)gDIM]);
+      if (d2 < best) {
+        best = d2;
+        bestc = c;
+      }
     }
-}
-static void compute_center_dists(
-    const vector<vector<float>>& C, int K, vector<float>& Dcc // KxK matrix
-) {
-    Dcc.assign((size_t)K*(size_t)K, 0.0f);
-    for (int i = 0; i < K; ++i) {
-        for (int j = i+1; j < K; ++j) {
-            float d = l2(C[i].data(), C[j].data());
-            Dcc[i*(size_t)K + j] = d;
-            Dcc[j*(size_t)K + i] = d;
-        }
-    }
+
+    label[i] = bestc;
+    cnt[bestc]++;
+
+    double* sc = &sum[bestc * (size_t)gDIM];
+    for (int d = 0; d < gDIM; ++d) sc[d] += pi[d];
+  }
 }
 
-// ---------------- Hamerly assignment ----------------
-static void assign_hamerly(
-    const vector<vector<float>>& P,
-    const vector<vector<float>>& C,
-    const vector<vector<float>>& prevC,
-    const vector<float>& s,            // per-center separation
-    const vector<float>& cMove,        // per-center movement ||C - prevC||
-    int K,
-    vector<int>& labels,
-    vector<float>& upper,              // per point
-    vector<float>& lower,              // per point
-    vector<vector<float>>& sum,
-    vector<int>& cnt
-) {
-    const int N = (int)P.size();
-    // lazy update bounds
-    float maxMove = 0.0f; for (int c = 0; c < K; ++c) maxMove = std::max(maxMove, cMove[c]);
-    for (int i = 0; i < N; ++i) {
-        int a = labels[i];
-        if (a >= 0) upper[i] += cMove[a];
-        lower[i] = std::max(0.0f, lower[i] - maxMove);
+// -------------------------- Hamerly --------------------------
+
+static void assign_hamerly(const vector<double>& P,
+                           const vector<double>& C,
+                           const vector<double>& /*prevC*/,
+                           const vector<double>& s,
+                           const vector<double>& cMove,
+                           int K,
+                           vector<int>& label,
+                           vector<double>& upper,
+                           vector<double>& lower,
+                           vector<double>& sum,
+                           vector<int>& cnt) {
+  const int n = (int)label.size();
+  std::fill(sum.begin(), sum.end(), 0.0);
+  std::fill(cnt.begin(), cnt.end(), 0);
+
+  double maxMove = 0.0;
+  for (int c = 0; c < K; ++c) maxMove = std::max(maxMove, cMove[c]);
+
+  for (int i = 0; i < n; ++i) {
+    int a = label[i];
+    if (a >= 0) upper[i] += cMove[a];
+    lower[i] = std::max(0.0, lower[i] - maxMove);
+  }
+
+  for (int i = 0; i < n; ++i) {
+    int a = label[i];
+    bool need = (a < 0);
+    if (!need) need = !(upper[i] <= s[a] && upper[i] <= lower[i]);
+
+    double u = upper[i];
+    int bestc = a;
+    double best = u;
+    double second = std::numeric_limits<double>::infinity();
+    const double* pi = &P[i * (size_t)gDIM];
+
+    if (need) {
+      if (a >= 0) best = std::sqrt(sqdist2(pi, &C[a * (size_t)gDIM]));
+      else best = std::numeric_limits<double>::infinity();
+
+      for (int c = 0; c < K; ++c) {
+        if (c == a) continue;
+        if (a >= 0) {
+          double ccsep = l2(&C[a * (size_t)gDIM], &C[c * (size_t)gDIM]);
+          if (best <= 0.5 * ccsep && best <= lower[i]) continue;
+        }
+        double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
+        if (d < best) {
+          second = best;
+          best = d;
+          bestc = c;
+        } else if (d < second) {
+          second = d;
+        }
+      }
+
+      u = best;
+      label[i] = bestc;
+      upper[i] = u;
+      lower[i] = second;
     }
 
-    for (int i = 0; i < N; ++i) {
-        int a = labels[i];
-        bool need = (a < 0);
-        if (!need) {
-            if (upper[i] <= s[a] && upper[i] <= lower[i]) need = false; else need = true;
-        }
-
-        float best = upper[i];
-        int bestc = a;
-        float second = std::numeric_limits<float>::infinity();
-
-        if (need) {
-            if (a >= 0) best = l2(P[i].data(), C[a].data());
-            else best = std::numeric_limits<float>::infinity();
-
-            for (int c = 0; c < K; ++c) if (c != a) {
-                if (a >= 0) {
-                    float ccsep = l2(C[a].data(), C[c].data());
-                    if (best <= 0.5f * ccsep && best <= lower[i]) continue;
-                }
-                float d = l2(P[i].data(), C[c].data());
-                if (d < best) { second = best; best = d; bestc = c; }
-                else if (d < second) { second = d; }
-            }
-            labels[i] = bestc;
-            upper[i]  = best;
-            lower[i]  = second;
-        }
-
-        sum[labels[i]][0] += P[i][0];
-        sum[labels[i]][1] += P[i][1];
-        cnt[labels[i]] += 1;
-    }
+    double* sc = &sum[bestc * (size_t)gDIM];
+    for (int d = 0; d < gDIM; ++d) sc[d] += pi[d];
+    cnt[bestc]++;
+  }
 }
 
-// ---------------- Elkan assignment ----------------
-static void assign_elkan(
-    const vector<vector<float>>& P,
-    const vector<vector<float>>& C,
-    const vector<vector<float>>& prevC,
-    const vector<float>& cMove,  // per center movement
-    const vector<float>& Dcc,    // KxK center distances
-    int K,
-    vector<int>& labels,
-    vector<float>& upper,        // per point
-    vector<float>& lowerMat,     // N*K, row-major
-    vector<vector<float>>& sum,
-    vector<int>& cnt
-) {
-    const int N = (int)P.size();
-    // lazy-update bounds
-    for (int i = 0; i < N; ++i) {
-        int a = labels[i];
-        if (a >= 0) upper[i] += cMove[a];
-        float* Li = &lowerMat[(size_t)i * (size_t)K];
-        for (int c = 0; c < K; ++c) Li[c] = std::max(0.0f, Li[c] - cMove[c]);
+// -------------------------- Elkan --------------------------
+
+static void assign_elkan(const vector<double>& P,
+                         const vector<double>& C,
+                         const vector<double>& /*prevC*/,
+                         const vector<double>& cMove,
+                         const vector<double>& Dcc,
+                         int K,
+                         vector<int>& label,
+                         vector<double>& upper,
+                         vector<double>& lowerMat,
+                         vector<double>& sum,
+                         vector<int>& cnt) {
+  const int n = (int)label.size();
+  std::fill(sum.begin(), sum.end(), 0.0);
+  std::fill(cnt.begin(), cnt.end(), 0);
+
+  for (int i = 0; i < n; ++i) {
+    int a = label[i];
+    if (a >= 0) upper[i] += cMove[a];
+    double* Li = &lowerMat[i * (size_t)K];
+    for (int c = 0; c < K; ++c) Li[c] = std::max(0.0, Li[c] - cMove[c]);
+  }
+
+  for (int i = 0; i < n; ++i) {
+    int a = label[i];
+    double* Li = &lowerMat[i * (size_t)K];
+    const double* pi = &P[i * (size_t)gDIM];
+
+    if (a < 0) {
+      double best = std::numeric_limits<double>::infinity();
+      int bestc = 0;
+      double second = std::numeric_limits<double>::infinity();
+
+      for (int c = 0; c < K; ++c) {
+        double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
+        Li[c] = d;
+        if (d < best) {
+          second = best;
+          best = d;
+          bestc = c;
+        } else if (d < second) {
+          second = d;
+        }
+      }
+
+      label[i] = a = bestc;
+      upper[i] = best;
+
+      double* sc = &sum[a * (size_t)gDIM];
+      for (int d = 0; d < gDIM; ++d) sc[d] += pi[d];
+      cnt[a]++;
+      continue;
     }
 
-    for (int i = 0; i < N; ++i) {
-        int a = labels[i];
-        float* Li = &lowerMat[(size_t)i * (size_t)K];
-
-        // First-time: compute all distances
-        if (a < 0) {
-            float best = std::numeric_limits<float>::infinity();
-            int bestc = 0;
-            float second = std::numeric_limits<float>::infinity();
-            for (int c = 0; c < K; ++c) {
-                float d = l2(P[i].data(), C[c].data());
-                Li[c] = d;
-                if (d < best) { second = best; best = d; bestc = c; }
-                else if (d < second) { second = d; }
-            }
-            labels[i] = a = bestc;
-            upper[i] = best;
-            sum[a][0] += P[i][0];
-            sum[a][1] += P[i][1];
-            cnt[a] += 1;
-            continue;
-        }
-
-        // global test
-        const float u0 = upper[i];
-        float bound = std::numeric_limits<float>::infinity();
-        for (int c = 0; c < K; ++c) if (c != a) {
-            float gate = std::max(Li[c], 0.5f * Dcc[(size_t)a*(size_t)K + c]);
-            if (gate < bound) bound = gate;
-        }
-        bool reassess = !(u0 <= bound);
-
-        int bestc = a;
-        float best = u0;
-        if (reassess) {
-            best = l2(P[i].data(), C[a].data()); // tighten
-            for (int c = 0; c < K; ++c) if (c != a) {
-                float gate = std::max(Li[c], 0.5f * Dcc[(size_t)a*(size_t)K + c]);
-                if (best <= gate) continue;
-                float d = l2(P[i].data(), C[c].data());
-                Li[c] = d;
-                if (d < best) {
-                    Li[a] = best;  // old best becomes lower bound for old a
-                    best = d; bestc = c; a = c;
-                }
-            }
-            upper[i] = best; labels[i] = bestc; Li[bestc] = best;
-        }
-
-        sum[labels[i]][0] += P[i][0];
-        sum[labels[i]][1] += P[i][1];
-        cnt[labels[i]] += 1;
+    const double u0 = upper[i];
+    double bound = std::numeric_limits<double>::infinity();
+    for (int c = 0; c < K; ++c) {
+      if (c == a) continue;
+      double gate = std::max(Li[c], 0.5 * Dcc[a * (size_t)K + c]);
+      if (gate < bound) bound = gate;
     }
+
+    bool reassess = !(u0 <= bound);
+    int bestc = a;
+    double best = u0;
+
+    if (reassess) {
+      best = std::sqrt(sqdist2(pi, &C[a * (size_t)gDIM]));
+      for (int c = 0; c < K; ++c) {
+        if (c == a) continue;
+        double gate = std::max(Li[c], 0.5 * Dcc[a * (size_t)K + c]);
+        if (best <= gate) continue;
+
+        double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
+        Li[c] = d;
+        if (d < best) {
+          Li[a] = best;
+          best = d;
+          bestc = c;
+          a = c;
+        }
+      }
+      upper[i] = best;
+      label[i] = bestc;
+      Li[bestc] = best;
+    }
+
+    double* sc = &sum[label[i] * (size_t)gDIM];
+    for (int d = 0; d < gDIM; ++d) sc[d] += pi[d];
+    cnt[label[i]]++;
+  }
 }
 
-// ---------------- Yinyang helpers & assignment ----------------
-static void group_centroids_kmeans(
-    const vector<vector<float>>& C, int K, int G, vector<int>& gid
-) {
-    G = std::max(1, std::min(G, K));
-    gid.assign(K, 0);
-    if (G == 1) { std::fill(gid.begin(), gid.end(), 0); return; }
+// -------------------------- Yinyang helpers --------------------------
 
-    vector<vector<float>> GC(G, vector<float>(DIM, 0.0f));
-    // init: pick evenly spaced centers
+static void kmeans_group_centroids(const vector<double>& C,
+                                   int K,
+                                   int G,
+                                   vector<int>& gid) {
+  G = std::max(1, std::min(G, K));
+  gid.assign(K, 0);
+  if (G == 1) {
+    std::fill(gid.begin(), gid.end(), 0);
+    return;
+  }
+
+  vector<double> GC((size_t)G * gDIM, 0.0);
+
+  for (int g = 0; g < G; ++g) {
+    int idx = (int)std::floor((double)g * K / G);
+    for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] = C[idx * (size_t)gDIM + d];
+  }
+
+  const int iters = 5;
+  vector<int> gcnt(G, 0);
+
+  for (int it = 0; it < iters; ++it) {
+    std::fill(gid.begin(), gid.end(), 0);
+
+    for (int c = 0; c < K; ++c) {
+      double best = std::numeric_limits<double>::infinity();
+      int bestg = 0;
+      for (int g = 0; g < G; ++g) {
+        double d2 = sqdist2(&C[c * (size_t)gDIM], &GC[g * (size_t)gDIM]);
+        if (d2 < best) {
+          best = d2;
+          bestg = g;
+        }
+      }
+      gid[c] = bestg;
+    }
+
+    std::fill(GC.begin(), GC.end(), 0.0);
+    std::fill(gcnt.begin(), gcnt.end(), 0);
+
+    for (int c = 0; c < K; ++c) {
+      int g = gid[c];
+      for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] += C[c * (size_t)gDIM + d];
+      gcnt[g]++;
+    }
+
     for (int g = 0; g < G; ++g) {
-        int idx = (int)std::floor((double)g * K / G);
-        GC[g][0] = C[idx][0];
-        GC[g][1] = C[idx][1];
+      if (gcnt[g] > 0) {
+        for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] /= gcnt[g];
+      }
     }
-    const int iters = 5;
-    vector<int> gcnt(G, 0);
-    for (int it = 0; it < iters; ++it) {
-        // assign centers to groups
-        for (int c = 0; c < K; ++c) {
-            float best = std::numeric_limits<float>::infinity(); int bestg = 0;
-            for (int g = 0; g < G; ++g) {
-                float d2 = sqdist2(C[c].data(), GC[g].data());
-                if (d2 < best) { best = d2; bestg = g; }
-            }
-            gid[c] = bestg;
-        }
-        // recompute group centroids
-        std::fill(GC.begin(), GC.end(), vector<float>(DIM, 0.0f));
-        std::fill(gcnt.begin(), gcnt.end(), 0);
-        for (int c = 0; c < K; ++c) {
-            int g = gid[c];
-            GC[g][0] += C[c][0];
-            GC[g][1] += C[c][1];
-            gcnt[g] += 1;
-        }
-        for (int g = 0; g < G; ++g) if (gcnt[g] > 0) {
-            GC[g][0] /= gcnt[g];
-            GC[g][1] /= gcnt[g];
-        }
-    }
+  }
 }
 
-static void assign_yinyang(
-    const vector<vector<float>>& P,
-    const vector<vector<float>>& C,
-    const vector<vector<float>>& prevC,
-    const vector<int>& gid,   // size K
-    int G,
-    const vector<float>& cMove,
-    int K,
-    vector<int>& labels,
-    vector<float>& upper,     // per point
-    vector<float>& lowerG,    // N*G row-major
-    vector<vector<float>>& sum,
-    vector<int>& cnt
-) {
-    const int N = (int)P.size();
-    // per-group movement (max center move in group)
-    vector<float> gMove(G, 0.0f);
-    for (int c = 0; c < K; ++c) gMove[gid[c]] = std::max(gMove[gid[c]], cMove[c]);
+static void assign_yinyang(const vector<double>& P,
+                           const vector<double>& C,
+                           const vector<double>& /*prevC*/,
+                           const vector<int>& gid,
+                           int G,
+                           const vector<double>& cMove,
+                           const vector<double>& /*Dcc*/,
+                           int K,
+                           vector<int>& label,
+                           vector<double>& upper,
+                           vector<double>& lowerG,
+                           vector<double>& sum,
+                           vector<int>& cnt) {
+  const int n = (int)label.size();
+  std::fill(sum.begin(), sum.end(), 0.0);
+  std::fill(cnt.begin(), cnt.end(), 0);
 
-    // lazy update
-    for (int i = 0; i < N; ++i) {
-        int a = labels[i];
-        if (a >= 0) upper[i] += cMove[a];
-        float* LG = &lowerG[(size_t)i * (size_t)G];
-        for (int g = 0; g < G; ++g) LG[g] = std::max(0.0f, LG[g] - gMove[g]);
-    }
+  vector<double> gMove(G, 0.0);
+  for (int c = 0; c < K; ++c) gMove[gid[c]] = std::max(gMove[gid[c]], cMove[c]);
 
-    for (int i = 0; i < N; ++i) {
-        int a = labels[i];
-        int ga = (a >= 0 ? gid[a] : -1);
-        float u = upper[i];
-        float* LG = &lowerG[(size_t)i * (size_t)G];
+  for (int i = 0; i < n; ++i) {
+    int a = label[i];
+    if (a >= 0) upper[i] += cMove[a];
+    double* LG = &lowerG[i * (size_t)G];
+    for (int g = 0; g < G; ++g) LG[g] = std::max(0.0, LG[g] - gMove[g]);
+  }
 
-        // global group test
-        float minLG = std::numeric_limits<float>::infinity();
-        for (int g = 0; g < G; ++g) minLG = std::min(minLG, LG[g]);
-        bool need = (a < 0) || !(u <= minLG);
+  for (int i = 0; i < n; ++i) {
+    int a = label[i];
+    const double* pi = &P[i * (size_t)gDIM];
+    double u = upper[i];
+    double* LG = &lowerG[i * (size_t)G];
 
-        float best = u;
-        int bestc = a;
+    double minLG = std::numeric_limits<double>::infinity();
+    for (int g = 0; g < G; ++g) minLG = std::min(minLG, LG[g]);
 
-        if (need) {
-            if (a >= 0) best = l2(P[i].data(), C[a].data());
-            else best = std::numeric_limits<float>::infinity();
+    bool need = (a < 0) || !(u <= minLG);
+    double best = u;
+    int bestc = a;
 
-            for (int g = 0; g < G; ++g) if (LG[g] < best) {
-                for (int c = 0; c < K; ++c) if (gid[c] == g) {
-                    if (c == a) continue;
-                    float d = l2(P[i].data(), C[c].data());
-                    if (d < best) { best = d; bestc = c; }
-                }
-            }
+    if (need) {
+      if (a >= 0) best = std::sqrt(sqdist2(pi, &C[a * (size_t)gDIM]));
+      else best = std::numeric_limits<double>::infinity();
 
-            // refresh group lower-bounds by min distance to any center in group
-            for (int g = 0; g < G; ++g) {
-                float gbest = std::numeric_limits<float>::infinity();
-                for (int c = 0; c < K; ++c) if (gid[c] == g) {
-                    float d = l2(P[i].data(), C[c].data());
-                    if (d < gbest) gbest = d;
-                }
-                LG[g] = gbest;
-            }
-
-            a = bestc; u = best; labels[i] = a; upper[i] = u; ga = gid[a];
+      for (int g = 0; g < G; ++g) {
+        if (LG[g] >= best) continue;
+        for (int c = 0; c < K; ++c) {
+          if (gid[c] != g || c == a) continue;
+          double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
+          if (d < best) {
+            best = d;
+            bestc = c;
+          }
         }
+      }
 
-        sum[a][0] += P[i][0];
-        sum[a][1] += P[i][1];
-        cnt[a] += 1;
+      for (int g = 0; g < G; ++g) {
+        double gbest = std::numeric_limits<double>::infinity();
+        for (int c = 0; c < K; ++c) {
+          if (gid[c] != g) continue;
+          double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
+          if (d < gbest) gbest = d;
+        }
+        LG[g] = gbest;
+      }
+
+      a = bestc;
+      u = best;
+      label[i] = a;
+      upper[i] = u;
     }
+
+    double* sc = &sum[a * (size_t)gDIM];
+    for (int d = 0; d < gDIM; ++d) sc[d] += pi[d];
+    cnt[a]++;
+  }
 }
 
+// -------------------------- Arg parsing --------------------------
 
-// ---------------- Main ----------------
-int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(&cout);
+struct Parsed {
+  int         K            = 5;
+  long long   limit        = -1;
+  vector<int> cols;
+  bool        colsSpecified = false;
+};
 
-    int choice = 1, N = 0, K = 0;
-    cout << "Choose k-means variant:\n";
-    cout << " [1] simple k-means (Lloyd)\n";
-    cout << " [2] elkan\n";
-    cout << " [3] hamerly\n";
-    cout << " [4] yinyang\n";
-    cout << "Enter choice: ";
+static Parsed parse_args(int argc, char** argv) {
+  std::unordered_map<string, int> cmap{
+      {"GAP", 2}, {"GRP", 3}, {"V", 4}, {"GI", 5}, {"SM1", 6}, {"SM2", 7}, {"SM3", 8},
+  };
+
+  Parsed a;
+
+  for (int i = 1; i < argc; ++i) {
+    string s(argv[i]);
+
+    auto take_val = [&](const string&) -> string {
+      size_t p = s.find('=');
+      if (p == string::npos) return "";
+      return s.substr(p + 1);
+    };
+
+    if (s.rfind("--k=", 0) == 0) {
+      a.K = std::stoi(take_val("--k"));
+      if (a.K <= 0) throw std::runtime_error("--k must be > 0");
+    } else if (s.rfind("--limit=", 0) == 0) {
+      a.limit = std::stoll(take_val("--limit"));
+    } else if (s.rfind("--cols=", 0) == 0) {
+      string v = take_val("--cols");
+      a.cols.clear();
+      size_t start = 0;
+      while (true) {
+        size_t pos = v.find(',', start);
+        string name = (pos == string::npos) ? v.substr(start) : v.substr(start, pos - start);
+        if (!name.empty()) {
+          auto it = cmap.find(name);
+          if (it == cmap.end()) throw std::runtime_error("Unknown column: " + name);
+          a.cols.push_back(it->second);
+        }
+        if (pos == string::npos) break;
+        start = pos + 1;
+      }
+      a.colsSpecified = true;
+    } else {
+      std::cerr << "Warning: unknown arg ignored: " << s << "\n";
+    }
+  }
+
+  // Default to all 7 features if --cols not provided
+  if (!a.colsSpecified) {
+    a.cols = {2, 3, 4, 5, 6, 7, 8};
+    a.colsSpecified = true;
+  }
+
+  return a;
+}
+
+// -------------------------- Main --------------------------
+
+int main(int argc, char** argv) {
+  Parsed args;
+  try {
+    args = parse_args(argc, argv);
+  } catch (const std::exception& e) {
+    std::cerr << "Arg error: " << e.what() << "\n";
+    return 1;
+  }
+
+  int K = args.K;
+  long long limit = args.limit;
+  int DIM = (int)args.cols.size();
+  gDIM = DIM;
+
+  if (DIM <= 0) {
+    std::cerr << "No features selected (DIM=0). Use --cols from {GAP,GRP,V,GI,SM1,SM2,SM3}.\n";
+    return 1;
+  }
+
+  vector<int> cols = args.cols;
+
+  // Debug banner
+  std::cerr << "K=" << K << " | DIM=" << DIM << " | cols:";
+  for (int c : cols) std::cerr << ' ' << c;
+  std::cerr << " | limit=" << limit << "\n";
+
+  // Choose variant (interactive)
+  int choice = 1;
+  {
+    cout << "Choose k-means variant:\n"
+            " [1] Lloyd\n"
+            " [2] Elkan\n"
+            " [3] Hamerly\n"
+            " [4] Yinyang\n"
+            "Enter choice: ";
     cin >> choice;
     if (choice < 1 || choice > 4) choice = 1;
+  }
 
-    cout << "Enter number of points: ";
-    cin >> N;
-    cout << "Enter number of clusters (K): ";
-    cin >> K;
-    if (N <= 0 || K <= 0 || K > N) {
-        cerr << "Invalid N/K (require N>0, K>0, K<=N)\n";
-        return 1;
+  // Read file
+  vector<double> P;  // flattened NxDIM
+  long long N = 0;
+
+  auto t_io0 = clk::now();
+
+  try {
+    fs::path fpath = fs::path(__FILE__).parent_path().parent_path() / "household_power_consumption.txt";
+    std::ifstream ifs(fpath);
+    if (!ifs) throw std::runtime_error("Cannot open file: " + fpath.string());
+
+    string line;
+    if (!std::getline(ifs, line)) throw std::runtime_error("Empty file");
+
+    auto oknum = [](std::string s) -> bool {
+      trim_inplace(s);
+      if (s.empty() || s == "?") return false;
+      char* end = nullptr;
+      std::strtod(s.c_str(), &end);
+      return end && *end == '\0';
+    };
+
+    P.reserve(1 << 20);
+
+    while (std::getline(ifs, line)) {
+      if (limit > 0 && N >= limit) break;
+
+      vector<string> tok;
+      tok.reserve(10);
+      size_t start = 0;
+      while (true) {
+        size_t pos = line.find(';', start);
+        if (pos == string::npos) {
+          tok.emplace_back(line.substr(start));
+          break;
+        }
+        tok.emplace_back(line.substr(start, pos - start));
+        start = pos + 1;
+      }
+
+      if ((int)tok.size() < 9) continue;
+
+      bool good = true;
+      for (int id : cols) {
+        if (id >= (int)tok.size()) {
+          good = false;
+          break;
+        }
+        trim_inplace(tok[id]);
+        if (!oknum(tok[id])) {
+          good = false;
+          break;
+        }
+      }
+      if (!good) continue;
+
+      for (int id : cols) P.push_back(std::stod(tok[id]));
+      ++N;
     }
 
-    // Data
-    vector<vector<float>> points(N, vector<float>(DIM));
-    vector<vector<float>> C(K, vector<float>(DIM));
-    vector<vector<float>> prevC(K, vector<float>(DIM));
+    auto t_io1 = clk::now();
+    double t_io = secd(t_io1 - t_io0).count();
 
-    vector<int> labels(N, -1);
-    vector<vector<float>> sum(K, vector<float>(DIM, 0.0f));
-    vector<int> cnt(K, 0);
+    ifs.close();
 
-    // Generate uniform random points (like your original code)
-    std::random_device rd; std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> dis(0.0f, 100.0f);
-    for (int i = 0; i < N; ++i) {
-        points[i][0] = dis(gen);
-        points[i][1] = dis(gen);
+    if (N < K) {
+      std::cerr << "Not enough rows after cleaning: N=" << N << " < K=" << K << "\n";
+      return 1;
     }
+  } catch (const std::exception& e) {
+    std::cerr << "Read error: " << e.what() << "\n";
+    return 1;
+  }
 
-    // Init: pick K random points as centroids
-    std::uniform_int_distribution<> idx_dis(0, N - 1);
+  // Initialize centroids (sample K unique points)
+  vector<double> C((size_t)K * DIM), prevC((size_t)K * DIM);
+  {
+    std::mt19937 gen(2025);
+    vector<long long> idx(N);
+    std::iota(idx.begin(), idx.end(), 0LL);
+    std::shuffle(idx.begin(), idx.end(), gen);
     for (int i = 0; i < K; ++i) {
-        int idx = idx_dis(gen);
-        C[i] = points[idx];
+      long long id = idx[i];
+      for (int d = 0; d < DIM; ++d) C[i * (size_t)DIM + d] = P[id * (size_t)DIM + d];
     }
     prevC = C;
+  }
 
-    // Variant-specific buffers
-    vector<float> s;               // Hamerly separation per center
-    vector<float> cMove(K, 0.0f);  // per center movement
-    vector<float> upper(N, std::numeric_limits<float>::infinity());
-    vector<float> lower(N, 0.0f);
+  // Common buffers
+  vector<int>    label((size_t)N, -1);
+  vector<double> sum((size_t)K * DIM, 0.0);
+  vector<int>    cnt(K, 0);
 
-    vector<float> Dcc;             // Elkan (& Yinyang extra) KxK
-    vector<float> lowerMat;        // Elkan N*K
-    if (choice == 2) lowerMat.assign((size_t)N * (size_t)K, 0.0f);
+  // Variant-specific state
+  vector<double> upper(N, std::numeric_limits<double>::infinity());
+  vector<double> lower(N, 0.0);
+  vector<double> cMove(K, 0.0), sK(K, 0.0);
+  vector<double> Dcc;
+  vector<double> lowerMat;      // N x K
+  vector<double> lowerG;        // N x G
+  int            G = std::max(1, std::min(K, 10));
+  vector<int>    gid(K, 0);
 
-    int G = std::max(1, std::min(K, 10)); // Yinyang groups
-    vector<int> gid(K, 0);
-    vector<float> lowerG;          // Yinyang N*G
-    if (choice == 4) lowerG.assign((size_t)N * (size_t)G, 0.0f);
+  if (choice == 2) lowerMat.assign((size_t)N * K, 0.0);
+  if (choice == 4) lowerG.assign((size_t)N * G, 0.0);
 
-    // Run
-    const double tol = 1e-4;
-    const int max_iter = 100;
-    int converged_after = max_iter;
+  const int    max_iter  = 100;
+  const double tol       = 1e-4;
+  int          it        = 0;
+  double       max_shift = 0.0;
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+  auto t0 = std::chrono::high_resolution_clock::now();
 
-    for (int it = 0; it < max_iter; ++it) {
-        // reset accumulators
-        for (int c = 0; c < K; ++c) { sum[c][0] = sum[c][1] = 0.0f; cnt[c] = 0; }
+  auto t_comp0 = clk::now();
 
-        // precompute movements and helpers
-        for (int c = 0; c < K; ++c) {
-            float dx = C[c][0] - prevC[c][0];
-            float dy = C[c][1] - prevC[c][1];
-            cMove[c] = std::sqrt(dx*dx + dy*dy);
-        }
-        if (choice == 3) compute_center_separation(C, K, s);
-        if (choice == 2 || choice == 4) compute_center_dists(C, K, Dcc);
-        if (choice == 4) group_centroids_kmeans(C, K, G, gid);
+  for (it = 0; it < max_iter; ++it) {
+    std::fill(sum.begin(), sum.end(), 0.0);
+    std::fill(cnt.begin(), cnt.end(), 0);
 
-        // assignment
-        switch (choice) {
-            case 1:
-                assign_lloyd(points, C, K, labels, sum, cnt);
-                break;
-            case 2:
-                assign_elkan(points, C, prevC, cMove, Dcc, K, labels, upper, lowerMat, sum, cnt);
-                break;
-            case 3:
-                assign_hamerly(points, C, prevC, s, cMove, K, labels, upper, lower, sum, cnt);
-                break;
-            case 4:
-                assign_yinyang(points, C, prevC, gid, G, cMove, K, labels, upper, lowerG, sum, cnt);
-                break;
-            default:
-                assign_lloyd(points, C, K, labels, sum, cnt);
-        }
-
-        // update centers & convergence
-        float max_shift = 0.0f;
-        for (int c = 0; c < K; ++c) {
-            prevC[c] = C[c];
-            if (cnt[c] > 0) {
-                C[c][0] = sum[c][0] / cnt[c];
-                C[c][1] = sum[c][1] / cnt[c];
-            }
-            float dx = C[c][0] - prevC[c][0];
-            float dy = C[c][1] - prevC[c][1];
-            float sh = std::sqrt(dx*dx + dy*dy);
-            if (sh > max_shift) max_shift = sh;
-        }
-
-        if (max_shift < tol) { converged_after = it + 1; break; }
-    }
-
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-    // ----- summary (with separator you wanted) -----
-    cout << "---------------------------------------------------------------------\n";
-    cout << "Converged after " << converged_after << " iteration(s)\n";
-    cout << "Variant: " << (choice==1?"Lloyd": choice==2?"Elkan": choice==3?"Hamerly":"Yinyang") << "\n";
-    cout << "Execution time (clustering only): " << ms << " ms\n";
-
-    // write file
-    ofstream outfile("clustering_result.txt");
-    if (!outfile.is_open()) {
-        cerr << "Error opening file for writing!\n";
-        return 1;
-    }
-    outfile << fixed << setprecision(1);
+    // compute centroid moves and precomputations
     for (int c = 0; c < K; ++c) {
-        outfile << "Cluster " << (c) << " : (" << C[c][0] << ", " << C[c][1] << ") ---> ";
-        bool first = true;
-        for (int i = 0; i < N; ++i) {
-            if (labels[i] == c) {
-                if (!first) outfile << " , ";
-                outfile << "Point (" << points[i][0] << ", " << points[i][1] << ")";
-                first = false;
-            }
-        }
-        outfile << "\n";
+      double sh = 0.0;
+      for (int d = 0; d < DIM; ++d) {
+        double dx = C[c * (size_t)DIM + d] - prevC[c * (size_t)DIM + d];
+        sh += dx * dx;
+      }
+      cMove[c] = std::sqrt(sh);
     }
-    outfile.close();
-    return 0;
+    if (choice == 3) compute_center_separation(C, K, sK);
+    if (choice == 2 || choice == 4) compute_center_dists(C, K, Dcc);
+    if (choice == 4) kmeans_group_centroids(C, K, G, gid);
+
+    // assign
+    switch (choice) {
+      case 1:
+        assign_lloyd(P, C, K, label, sum, cnt);
+        break;
+      case 2:
+        assign_elkan(P, C, prevC, cMove, Dcc, K, label, upper, lowerMat, sum, cnt);
+        break;
+      case 3:
+        assign_hamerly(P, C, prevC, sK, cMove, K, label, upper, lower, sum, cnt);
+        break;
+      case 4:
+        assign_yinyang(P, C, prevC, gid, G, cMove, Dcc, K, label, upper, lowerG, sum, cnt);
+        break;
+    }
+
+    // update
+    prevC = C;
+    max_shift = 0.0;
+
+    for (int c = 0; c < K; ++c) {
+      double sh = 0.0;
+      if (cnt[c] > 0) {
+        for (int d = 0; d < DIM; ++d) {
+          double oldv = C[c * (size_t)DIM + d];
+          C[c * (size_t)DIM + d] = sum[c * (size_t)DIM + d] / cnt[c];
+          double dx = C[c * (size_t)DIM + d] - oldv;
+          sh += dx * dx;
+        }
+      } else {
+        for (int d = 0; d < DIM; ++d) {
+          double dx = 0.0;
+          sh += dx * dx;
+        }
+      }
+      double mv = std::sqrt(sh);
+      if (mv > max_shift) max_shift = mv;
+    }
+
+    if (max_shift < tol) break;
+  }
+
+  auto t_comp1 = clk::now();
+  double t_compute = secd(t_comp1 - t_comp0).count();
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  double secs = std::chrono::duration<double>(t1 - t0).count();
+
+  cout << "--------------------------------------------------------------------------\n";
+  cout << "Converged after " << (it + 1) << " iteration(s)\n";
+  cout << "Variant: " << (choice == 1 ? "Lloyd" : choice == 2 ? "Elkan" : choice == 3 ? "Hamerly" : "Yinyang") << "\n";
+  cout << "Time (s): " << secs << "\n";
+  cout << "Rows used (N): " << N << " | Features (DIM): " << DIM << " | K: " << K << "\n";
+
+  double t_total = t_io + t_compute;
+  double p = 1.0 - (t_io / t_total);
+
+  std::cout << "\n";
+  std::cout << "I/O time (s): " << t_io << "\n";
+  std::cout << "Compute time (s): " << t_compute << "\n";
+  std::cout << "Total time (s): " << t_total << "\n";
+  std::cout << "Parallelizable fraction p ≈ " << p << "\n";
+
+  // Write output (same format as MPI version)
+  {
+    fs::path out = fs::current_path() / "clustering_result.txt";
+    std::ofstream ofs(out);
+    ofs << std::fixed << std::setprecision(3);
+
+    for (int c = 0; c < K; ++c) {
+      ofs << "Cluster " << (c + 1) << " : (";
+      for (int d = 0; d < DIM; ++d) {
+        if (d) ofs << ", ";
+        ofs << C[c * (size_t)DIM + d];
+      }
+      ofs << ") --> ";
+
+      bool first = true;
+      for (long long i = 0; i < N; ++i) {
+        if (label[(size_t)i] != c) continue;
+        if (!first) ofs << ", ";
+        first = false;
+        ofs << "(";
+        for (int d = 0; d < DIM; ++d) {
+          if (d) ofs << ", ";
+          ofs << P[(size_t)i * (size_t)DIM + d];
+        }
+        ofs << ")";
+      }
+      ofs << "\n";
+    }
+
+    ofs.close();
+    cout << "Wrote " << out << "\n";
+  }
+
+  return 0;
 }
