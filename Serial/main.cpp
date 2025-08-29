@@ -24,7 +24,7 @@ using std::vector;
 
 namespace fs = std::filesystem;
 
-// -------------------------- Utilities --------------------------
+// string trimming helper for input parsing
 static inline void trim_inplace(std::string& s) {
   size_t a = s.find_first_not_of(" \t\r");
   if (a == std::string::npos) { s.clear(); return; }
@@ -32,11 +32,10 @@ static inline void trim_inplace(std::string& s) {
   s = s.substr(a, b - a + 1);
 }
 
-// Global runtime dimension (set after parsing --cols)
+// global dimension (set from CLI args, e.g. --cols)
 static int gDIM = 2;
 
-// -------------------------- Math --------------------------
-
+//math
 inline double sqdist2(const double* p, const double* c) {
   double s = 0.0;
   for (int d = 0; d < gDIM; ++d) {
@@ -50,8 +49,7 @@ inline double l2(const double* a, const double* b) {
   return std::sqrt(sqdist2(a, b));
 }
 
-// --------------- Center Separation (Elkan / Hamerly) ---------------
-
+// for Hamerly/Elkan pruning
 static void compute_center_separation(const vector<double>& C, int K, vector<double>& s) {
   s.assign(K, std::numeric_limits<double>::infinity());
   for (int c = 0; c < K; ++c) {
@@ -75,8 +73,7 @@ static void compute_center_dists(const vector<double>& C, int K, vector<double>&
   }
 }
 
-// -------------------------- Lloyd --------------------------
-
+//Lloyd
 static void assign_lloyd(const vector<double>& P,
                          const vector<double>& C,
                          int K,
@@ -105,8 +102,7 @@ static void assign_lloyd(const vector<double>& P,
   }
 }
 
-// -------------------------- Hamerly --------------------------
-
+//hamerly
 static void assign_hamerly(const vector<double>& P,
                            const vector<double>& C,
                            const vector<double>& /*prevC*/,
@@ -169,8 +165,7 @@ static void assign_hamerly(const vector<double>& P,
   }
 }
 
-// -------------------------- Elkan --------------------------
-
+//elkan
 static void assign_elkan(const vector<double>& P,
                          const vector<double>& C,
                          const vector<double>& /*prevC*/,
@@ -253,8 +248,7 @@ static void assign_elkan(const vector<double>& P,
   }
 }
 
-// -------------------------- Yinyang helpers --------------------------
-
+//yinyang
 static void kmeans_group_centroids(const vector<double>& C, int K, int G, vector<int>& gid) {
   G = std::max(1, std::min(G, K));
   gid.assign(K, 0);
@@ -370,8 +364,7 @@ static void assign_yinyang(const vector<double>& P,
   }
 }
 
-// -------------------------- Arg parsing --------------------------
-
+// parse CLI args (--k, --limit, --cols)
 struct Parsed {
   int         K            = 5;
   long long   limit        = -1;
@@ -421,7 +414,6 @@ static Parsed parse_args(int argc, char** argv) {
     }
   }
 
-  // Default to all 7 features if --cols not provided
   if (!a.colsSpecified) {
     a.cols = {2, 3, 4, 5, 6, 7, 8};
     a.colsSpecified = true;
@@ -430,8 +422,8 @@ static Parsed parse_args(int argc, char** argv) {
   return a;
 }
 
-// -------------------------- Main --------------------------
 
+//main
 int main(int argc, char** argv) {
   Parsed args;
   try {
@@ -453,12 +445,10 @@ int main(int argc, char** argv) {
 
   vector<int> cols = args.cols;
 
-  // Debug banner
   std::cerr << "K=" << K << " | DIM=" << DIM << " | cols:";
   for (int c : cols) std::cerr << ' ' << c;
   std::cerr << " | limit=" << limit << "\n";
 
-  // Choose variant (interactive)
   int choice = 1;
   {
     cout << "Choose k-means variant:\n"
@@ -471,8 +461,7 @@ int main(int argc, char** argv) {
     if (choice < 1 || choice > 4) choice = 1;
   }
 
-  // ---------------- Read file (timed) ----------------
-  vector<double> P;   // flattened NxDIM
+  vector<double> P;
   long long N = 0;
 
   double t_io  = 0.0;
@@ -538,7 +527,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Initialize centroids (sample K unique points)
   vector<double> C((size_t)K * DIM), prevC((size_t)K * DIM);
   {
     std::mt19937 gen(2025);
@@ -552,18 +540,16 @@ int main(int argc, char** argv) {
     prevC = C;
   }
 
-  // Common buffers
   vector<int>    label((size_t)N, -1);
   vector<double> sum((size_t)K * DIM, 0.0);
   vector<int>    cnt(K, 0);
 
-  // Variant-specific state
   vector<double> upper(N, std::numeric_limits<double>::infinity());
   vector<double> lower(N, 0.0);
   vector<double> cMove(K, 0.0), sK(K, 0.0);
   vector<double> Dcc;
-  vector<double> lowerMat;      // N x K
-  vector<double> lowerG;        // N x G
+  vector<double> lowerMat;
+  vector<double> lowerG;
   int            G = std::max(1, std::min(K, 10));
   vector<int>    gid(K, 0);
 
@@ -575,14 +561,12 @@ int main(int argc, char** argv) {
   int          it        = 0;
   double       max_shift = 0.0;
 
-  // ---------------- Compute (timed) ----------------
   auto t_comp0 = clk::now();
 
   for (it = 0; it < max_iter; ++it) {
     std::fill(sum.begin(), sum.end(), 0.0);
     std::fill(cnt.begin(), cnt.end(), 0);
 
-    // centroid moves + precomputations
     for (int c = 0; c < K; ++c) {
       double sh = 0.0;
       for (int d = 0; d < DIM; ++d) {
@@ -629,7 +613,7 @@ int main(int argc, char** argv) {
   auto   t_comp1   = clk::now();
   double t_compute = secd(t_comp1 - t_comp0).count();
 
-  // ---------------- Report ----------------
+  //report
   double t_total = t_io + t_compute;
   double p       = 1.0 - (t_io / t_total);
 
@@ -642,7 +626,7 @@ int main(int argc, char** argv) {
   cout << "Parallelizable fraction p ≈ " << p << "\n";
   cout << "Rows used (N): " << N << " | Features (DIM): " << DIM << " | K: " << K << "\n";
 
-  // ---------------- Write output (same format as MPI version) ----------------
+  //output
   {
     fs::path out = fs::current_path() / "clustering_result.txt";
     std::ofstream ofs(out);
