@@ -1,33 +1,3 @@
-// Serial K-Means Variants: Lloyd, Elkan, Hamerly, Yinyang (file-driven, dimension-agnostic)
-// Reads points from a semicolon-separated file "household_power_consumption.txt"
-// placed in the PARENT directory of this source file. Uses ANY number of chosen columns as features.
-// The program ALWAYS asks the user which variant to run; K and columns come from CLI.
-//
-// ---------------------------------------------------------------
-// Build:
-//   g++ -std=gnu++17 -O3 -march=native -o kmeans_serial kmeans_serial.cpp
-//
-// Run examples:
-//   ./kmeans_serial --k=5 --cols=GAP,V --limit=200000
-//   ./kmeans_serial --k=6 --cols=GI,SM1,SM2                  # 3D features
-//   ./kmeans_serial --k=6 --cols=GAP,GRP,V,GI,SM1,SM2,SM3    # 7D (default)
-//
-// Args:
-//   --k=<int>            number of clusters (required; >0)
-//   --cols=C1[,C2,...]   one or more columns as features (default: GAP,GRP,V,GI,SM1,SM2,SM3)
-//                        from {GAP,GRP,V,GI,SM1,SM2,SM3}
-//                          GAP=Global_active_power, GRP=Global_reactive_power,
-//                          V=Voltage, GI=Global_intensity, SM*=Sub_metering_*
-//   --limit=<int>        cap maximum rows loaded (optional)
-//
-// Notes:
-// - Dimension (DIM) is determined at runtime from the number of columns in --cols.
-// - If --cols is omitted, defaults to all 7 features.
-// - File path: parent_path(__FILE__) / "household_power_consumption.txt".
-// - Output: clustering_result.txt in current working directory.
-// - Educational implementation; production can add k-means++, SIMD, OpenMP, etc.
-// ---------------------------------------------------------------
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -43,8 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <chrono>
-using clk = std::chrono::high_resolution_clock;
+using clk  = std::chrono::high_resolution_clock;
 using secd = std::chrono::duration<double>;
 
 using std::cin;
@@ -56,13 +25,9 @@ using std::vector;
 namespace fs = std::filesystem;
 
 // -------------------------- Utilities --------------------------
-
 static inline void trim_inplace(std::string& s) {
   size_t a = s.find_first_not_of(" \t\r");
-  if (a == std::string::npos) {
-    s.clear();
-    return;
-  }
+  if (a == std::string::npos) { s.clear(); return; }
   size_t b = s.find_last_not_of(" \t\r");
   s = s.substr(a, b - a + 1);
 }
@@ -129,10 +94,7 @@ static void assign_lloyd(const vector<double>& P,
 
     for (int c = 0; c < K; ++c) {
       double d2 = sqdist2(pi, &C[c * (size_t)gDIM]);
-      if (d2 < best) {
-        best = d2;
-        bestc = c;
-      }
+      if (d2 < best) { best = d2; bestc = c; }
     }
 
     label[i] = bestc;
@@ -191,13 +153,8 @@ static void assign_hamerly(const vector<double>& P,
           if (best <= 0.5 * ccsep && best <= lower[i]) continue;
         }
         double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
-        if (d < best) {
-          second = best;
-          best = d;
-          bestc = c;
-        } else if (d < second) {
-          second = d;
-        }
+        if (d < best) { second = best; best = d; bestc = c; }
+        else if (d < second) { second = d; }
       }
 
       u = best;
@@ -249,13 +206,8 @@ static void assign_elkan(const vector<double>& P,
       for (int c = 0; c < K; ++c) {
         double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
         Li[c] = d;
-        if (d < best) {
-          second = best;
-          best = d;
-          bestc = c;
-        } else if (d < second) {
-          second = d;
-        }
+        if (d < best) { second = best; best = d; bestc = c; }
+        else if (d < second) { second = d; }
       }
 
       label[i] = a = bestc;
@@ -288,12 +240,7 @@ static void assign_elkan(const vector<double>& P,
 
         double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
         Li[c] = d;
-        if (d < best) {
-          Li[a] = best;
-          best = d;
-          bestc = c;
-          a = c;
-        }
+        if (d < best) { Li[a] = best; best = d; bestc = c; a = c; }
       }
       upper[i] = best;
       label[i] = bestc;
@@ -308,16 +255,10 @@ static void assign_elkan(const vector<double>& P,
 
 // -------------------------- Yinyang helpers --------------------------
 
-static void kmeans_group_centroids(const vector<double>& C,
-                                   int K,
-                                   int G,
-                                   vector<int>& gid) {
+static void kmeans_group_centroids(const vector<double>& C, int K, int G, vector<int>& gid) {
   G = std::max(1, std::min(G, K));
   gid.assign(K, 0);
-  if (G == 1) {
-    std::fill(gid.begin(), gid.end(), 0);
-    return;
-  }
+  if (G == 1) { std::fill(gid.begin(), gid.end(), 0); return; }
 
   vector<double> GC((size_t)G * gDIM, 0.0);
 
@@ -337,28 +278,20 @@ static void kmeans_group_centroids(const vector<double>& C,
       int bestg = 0;
       for (int g = 0; g < G; ++g) {
         double d2 = sqdist2(&C[c * (size_t)gDIM], &GC[g * (size_t)gDIM]);
-        if (d2 < best) {
-          best = d2;
-          bestg = g;
-        }
+        if (d2 < best) { best = d2; bestg = g; }
       }
       gid[c] = bestg;
     }
 
     std::fill(GC.begin(), GC.end(), 0.0);
     std::fill(gcnt.begin(), gcnt.end(), 0);
-
     for (int c = 0; c < K; ++c) {
       int g = gid[c];
       for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] += C[c * (size_t)gDIM + d];
       gcnt[g]++;
     }
-
-    for (int g = 0; g < G; ++g) {
-      if (gcnt[g] > 0) {
-        for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] /= gcnt[g];
-      }
-    }
+    for (int g = 0; g < G; ++g) if (gcnt[g] > 0)
+      for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] /= gcnt[g];
   }
 }
 
@@ -411,10 +344,7 @@ static void assign_yinyang(const vector<double>& P,
         for (int c = 0; c < K; ++c) {
           if (gid[c] != g || c == a) continue;
           double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
-          if (d < best) {
-            best = d;
-            bestc = c;
-          }
+          if (d < best) { best = d; bestc = c; }
         }
       }
 
@@ -541,11 +471,12 @@ int main(int argc, char** argv) {
     if (choice < 1 || choice > 4) choice = 1;
   }
 
-  // Read file
-  vector<double> P;  // flattened NxDIM
+  // ---------------- Read file (timed) ----------------
+  vector<double> P;   // flattened NxDIM
   long long N = 0;
 
-  auto t_io0 = clk::now();
+  double t_io  = 0.0;
+  auto   t_io0 = clk::now();
 
   try {
     fs::path fpath = fs::path(__FILE__).parent_path().parent_path() / "household_power_consumption.txt";
@@ -573,10 +504,7 @@ int main(int argc, char** argv) {
       size_t start = 0;
       while (true) {
         size_t pos = line.find(';', start);
-        if (pos == string::npos) {
-          tok.emplace_back(line.substr(start));
-          break;
-        }
+        if (pos == string::npos) { tok.emplace_back(line.substr(start)); break; }
         tok.emplace_back(line.substr(start, pos - start));
         start = pos + 1;
       }
@@ -585,15 +513,9 @@ int main(int argc, char** argv) {
 
       bool good = true;
       for (int id : cols) {
-        if (id >= (int)tok.size()) {
-          good = false;
-          break;
-        }
+        if (id >= (int)tok.size()) { good = false; break; }
         trim_inplace(tok[id]);
-        if (!oknum(tok[id])) {
-          good = false;
-          break;
-        }
+        if (!oknum(tok[id])) { good = false; break; }
       }
       if (!good) continue;
 
@@ -601,15 +523,16 @@ int main(int argc, char** argv) {
       ++N;
     }
 
-    auto t_io1 = clk::now();
-    double t_io = secd(t_io1 - t_io0).count();
-
     ifs.close();
 
     if (N < K) {
       std::cerr << "Not enough rows after cleaning: N=" << N << " < K=" << K << "\n";
       return 1;
     }
+
+    auto t_io1 = clk::now();
+    t_io = secd(t_io1 - t_io0).count();
+
   } catch (const std::exception& e) {
     std::cerr << "Read error: " << e.what() << "\n";
     return 1;
@@ -652,15 +575,14 @@ int main(int argc, char** argv) {
   int          it        = 0;
   double       max_shift = 0.0;
 
-  auto t0 = std::chrono::high_resolution_clock::now();
-
+  // ---------------- Compute (timed) ----------------
   auto t_comp0 = clk::now();
 
   for (it = 0; it < max_iter; ++it) {
     std::fill(sum.begin(), sum.end(), 0.0);
     std::fill(cnt.begin(), cnt.end(), 0);
 
-    // compute centroid moves and precomputations
+    // centroid moves + precomputations
     for (int c = 0; c < K; ++c) {
       double sh = 0.0;
       for (int d = 0; d < DIM; ++d) {
@@ -673,20 +595,12 @@ int main(int argc, char** argv) {
     if (choice == 2 || choice == 4) compute_center_dists(C, K, Dcc);
     if (choice == 4) kmeans_group_centroids(C, K, G, gid);
 
-    // assign
+    // assignment
     switch (choice) {
-      case 1:
-        assign_lloyd(P, C, K, label, sum, cnt);
-        break;
-      case 2:
-        assign_elkan(P, C, prevC, cMove, Dcc, K, label, upper, lowerMat, sum, cnt);
-        break;
-      case 3:
-        assign_hamerly(P, C, prevC, sK, cMove, K, label, upper, lower, sum, cnt);
-        break;
-      case 4:
-        assign_yinyang(P, C, prevC, gid, G, cMove, Dcc, K, label, upper, lowerG, sum, cnt);
-        break;
+      case 1: assign_lloyd(P, C, K, label, sum, cnt); break;
+      case 2: assign_elkan(P, C, prevC, cMove, Dcc, K, label, upper, lowerMat, sum, cnt); break;
+      case 3: assign_hamerly(P, C, prevC, sK, cMove, K, label, upper, lower, sum, cnt); break;
+      case 4: assign_yinyang(P, C, prevC, gid, G, cMove, Dcc, K, label, upper, lowerG, sum, cnt); break;
     }
 
     // update
@@ -703,10 +617,7 @@ int main(int argc, char** argv) {
           sh += dx * dx;
         }
       } else {
-        for (int d = 0; d < DIM; ++d) {
-          double dx = 0.0;
-          sh += dx * dx;
-        }
+        for (int d = 0; d < DIM; ++d) { double dx = 0.0; sh += dx * dx; }
       }
       double mv = std::sqrt(sh);
       if (mv > max_shift) max_shift = mv;
@@ -715,28 +626,23 @@ int main(int argc, char** argv) {
     if (max_shift < tol) break;
   }
 
-  auto t_comp1 = clk::now();
+  auto   t_comp1   = clk::now();
   double t_compute = secd(t_comp1 - t_comp0).count();
 
-  auto t1 = std::chrono::high_resolution_clock::now();
-  double secs = std::chrono::duration<double>(t1 - t0).count();
+  // ---------------- Report ----------------
+  double t_total = t_io + t_compute;
+  double p       = 1.0 - (t_io / t_total);
 
   cout << "--------------------------------------------------------------------------\n";
   cout << "Converged after " << (it + 1) << " iteration(s)\n";
   cout << "Variant: " << (choice == 1 ? "Lloyd" : choice == 2 ? "Elkan" : choice == 3 ? "Hamerly" : "Yinyang") << "\n";
-  cout << "Time (s): " << secs << "\n";
+  cout << "I/O time (s): " << t_io << "\n";
+  cout << "Compute time (s): " << t_compute << "\n";
+  cout << "Total time (s): " << t_total << "\n";
+  cout << "Parallelizable fraction p ≈ " << p << "\n";
   cout << "Rows used (N): " << N << " | Features (DIM): " << DIM << " | K: " << K << "\n";
 
-  double t_total = t_io + t_compute;
-  double p = 1.0 - (t_io / t_total);
-
-  std::cout << "\n";
-  std::cout << "I/O time (s): " << t_io << "\n";
-  std::cout << "Compute time (s): " << t_compute << "\n";
-  std::cout << "Total time (s): " << t_total << "\n";
-  std::cout << "Parallelizable fraction p ≈ " << p << "\n";
-
-  // Write output (same format as MPI version)
+  // ---------------- Write output (same format as MPI version) ----------------
   {
     fs::path out = fs::current_path() / "clustering_result.txt";
     std::ofstream ofs(out);
@@ -744,10 +650,7 @@ int main(int argc, char** argv) {
 
     for (int c = 0; c < K; ++c) {
       ofs << "Cluster " << (c + 1) << " : (";
-      for (int d = 0; d < DIM; ++d) {
-        if (d) ofs << ", ";
-        ofs << C[c * (size_t)DIM + d];
-      }
+      for (int d = 0; d < DIM; ++d) { if (d) ofs << ", "; ofs << C[c * (size_t)DIM + d]; }
       ofs << ") --> ";
 
       bool first = true;
@@ -756,10 +659,7 @@ int main(int argc, char** argv) {
         if (!first) ofs << ", ";
         first = false;
         ofs << "(";
-        for (int d = 0; d < DIM; ++d) {
-          if (d) ofs << ", ";
-          ofs << P[(size_t)i * (size_t)DIM + d];
-        }
+        for (int d = 0; d < DIM; ++d) { if (d) ofs << ", "; ofs << P[(size_t)i * (size_t)DIM + d]; }
         ofs << ")";
       }
       ofs << "\n";

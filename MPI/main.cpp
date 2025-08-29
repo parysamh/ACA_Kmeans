@@ -8,25 +8,23 @@
 //   mpic++ -std=gnu++17 -O3 -march=native -o kmeans_variants kmeans_variants.cpp
 //
 // Run examples:
-//   mpirun -np 4 ./kmeans_variants --k=5 --cols=GAP,V --limit=200000
-//   mpirun -np 8 ./kmeans_variants --k=6 --cols=GI,SM1,SM2                  # 3D features
-//   mpirun -np 8 ./kmeans_variants --k=6 --cols=GAP,GRP,V,GI,SM1,SM2,SM3    # 7D
+//   mpirun -np 4  ./kmeans_variants --k=5 --cols=GAP,V --limit=200000
+//   mpirun -np 8  ./kmeans_variants --k=6 --cols=GI,SM1,SM2
+//   mpirun -np 14 ./kmeans_variants --k=6 --cols=GAP,GRP,V,GI,SM1,SM2,SM3 --limit=100000
 //
 // Args:
 //   --k=<int>            number of clusters (required; >0)
 //   --cols=C1[,C2,...]   one or more columns as features (default: GAP,GRP,V,GI,SM1,SM2,SM3)
 //                        from {GAP,GRP,V,GI,SM1,SM2,SM3}
-//                          GAP=Global_active_power, GRP=Global_reactive_power,
-//                          V=Voltage, GI=Global_intensity, SM*=Sub_metering_*
 //   --limit=<int>        cap maximum rows loaded (optional)
 //
 // Notes:
 // - Dimension (DIM) is determined at runtime from the number of columns in --cols.
-// - If --cols is omitted, defaults to GAP,GRP,V,GI,SM1,SM2,SM3 (7D).
+// - If --cols is omitted, defaults to all 7 features.
 // - Rank 0 reads the file, parses selected columns, skips rows with missing values ('?'), then Scatterv's.
 // - File path: parent_path(__FILE__) / "household_power_consumption.txt".
 // - Output: clustering_result.txt in current working directory on rank 0.
-// - Educational implementation; production can add k-means++, SIMD, OpenMP, etc.
+// - This version reports only I/O, Compute, and Total times (I/O + Compute).
 // ---------------------------------------------------------------
 
 #include <mpi.h>
@@ -45,10 +43,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <chrono>
-using clk = std::chrono::high_resolution_clock;
-using secd = std::chrono::duration<double>;
-
 using std::cin;
 using std::cout;
 using std::endl;
@@ -61,10 +55,7 @@ namespace fs = std::filesystem;
 
 static inline void trim_inplace(std::string& s) {
   size_t a = s.find_first_not_of(" \t\r");
-  if (a == std::string::npos) {
-    s.clear();
-    return;
-  }
+  if (a == std::string::npos) { s.clear(); return; }
   size_t b = s.find_last_not_of(" \t\r");
   s = s.substr(a, b - a + 1);
 }
@@ -131,10 +122,7 @@ static void assign_lloyd(const vector<double>& P,
 
     for (int c = 0; c < K; ++c) {
       double d2 = sqdist2(pi, &C[c * (size_t)gDIM]);
-      if (d2 < best) {
-        best = d2;
-        bestc = c;
-      }
+      if (d2 < best) { best = d2; bestc = c; }
     }
 
     label[i] = bestc;
@@ -193,13 +181,8 @@ static void assign_hamerly(const vector<double>& P,
           if (best <= 0.5 * ccsep && best <= lower[i]) continue;
         }
         double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
-        if (d < best) {
-          second = best;
-          best = d;
-          bestc = c;
-        } else if (d < second) {
-          second = d;
-        }
+        if (d < best) { second = best; best = d; bestc = c; }
+        else if (d < second) { second = d; }
       }
 
       u = best;
@@ -251,13 +234,8 @@ static void assign_elkan(const vector<double>& P,
       for (int c = 0; c < K; ++c) {
         double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
         Li[c] = d;
-        if (d < best) {
-          second = best;
-          best = d;
-          bestc = c;
-        } else if (d < second) {
-          second = d;
-        }
+        if (d < best) { second = best; best = d; bestc = c; }
+        else if (d < second) { second = d; }
       }
 
       label[i] = a = bestc;
@@ -290,12 +268,7 @@ static void assign_elkan(const vector<double>& P,
 
         double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
         Li[c] = d;
-        if (d < best) {
-          Li[a] = best;
-          best = d;
-          bestc = c;
-          a = c;
-        }
+        if (d < best) { Li[a] = best; best = d; bestc = c; a = c; }
       }
       upper[i] = best;
       label[i] = bestc;
@@ -310,16 +283,10 @@ static void assign_elkan(const vector<double>& P,
 
 // -------------------------- Yinyang helpers --------------------------
 
-static void kmeans_group_centroids(const vector<double>& C,
-                                   int K,
-                                   int G,
-                                   vector<int>& gid) {
+static void kmeans_group_centroids(const vector<double>& C, int K, int G, vector<int>& gid) {
   G = std::max(1, std::min(G, K));
   gid.assign(K, 0);
-  if (G == 1) {
-    std::fill(gid.begin(), gid.end(), 0);
-    return;
-  }
+  if (G == 1) { std::fill(gid.begin(), gid.end(), 0); return; }
 
   vector<double> GC((size_t)G * gDIM, 0.0);
 
@@ -339,28 +306,20 @@ static void kmeans_group_centroids(const vector<double>& C,
       int bestg = 0;
       for (int g = 0; g < G; ++g) {
         double d2 = sqdist2(&C[c * (size_t)gDIM], &GC[g * (size_t)gDIM]);
-        if (d2 < best) {
-          best = d2;
-          bestg = g;
-        }
+        if (d2 < best) { best = d2; bestg = g; }
       }
       gid[c] = bestg;
     }
 
     std::fill(GC.begin(), GC.end(), 0.0);
     std::fill(gcnt.begin(), gcnt.end(), 0);
-
     for (int c = 0; c < K; ++c) {
       int g = gid[c];
       for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] += C[c * (size_t)gDIM + d];
       gcnt[g]++;
     }
-
-    for (int g = 0; g < G; ++g) {
-      if (gcnt[g] > 0) {
-        for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] /= gcnt[g];
-      }
-    }
+    for (int g = 0; g < G; ++g) if (gcnt[g] > 0)
+      for (int d = 0; d < gDIM; ++d) GC[g * (size_t)gDIM + d] /= gcnt[g];
   }
 }
 
@@ -413,10 +372,7 @@ static void assign_yinyang(const vector<double>& P,
         for (int c = 0; c < K; ++c) {
           if (gid[c] != g || c == a) continue;
           double d = std::sqrt(sqdist2(pi, &C[c * (size_t)gDIM]));
-          if (d < best) {
-            best = d;
-            bestc = c;
-          }
+          if (d < best) { best = d; bestc = c; }
         }
       }
 
@@ -442,8 +398,7 @@ static void assign_yinyang(const vector<double>& P,
   }
 }
 
-// -------------------------- Arg parsing --------------------------
-
+// ---------------------- Arg parsing ----------------------
 struct Parsed {
   int         K            = 5;   // default K=5
   long long   limit        = -1;  // optional
@@ -460,7 +415,6 @@ static Parsed parse_args(int argc, char** argv) {
 
   for (int i = 1; i < argc; ++i) {
     string s(argv[i]);
-
     auto take_val = [&](const string&) -> string {
       size_t p = s.find('=');
       if (p == string::npos) return "";
@@ -493,7 +447,7 @@ static Parsed parse_args(int argc, char** argv) {
     }
   }
 
-  // Default to GAP,GRP,V,GI,SM1,SM2,SM3 if --cols not provided
+  // Default to all 7 features if --cols not provided
   if (!a.colsSpecified) {
     a.cols = {2, 3, 4, 5, 6, 7, 8};
     a.colsSpecified = true;
@@ -502,11 +456,9 @@ static Parsed parse_args(int argc, char** argv) {
   return a;
 }
 
-// -------------------------- Main --------------------------
-
+// ----------------------------- Main -----------------------------
 int main(int argc, char** argv) {
   MPI_Init(&argc, &argv);
-
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
@@ -522,16 +474,8 @@ int main(int argc, char** argv) {
   }
 
   // Broadcast simple scalars first
-  int K = 0;
-  long long limit = -1;
-  int DIM = 0;
-
-  if (rank == 0) {
-    K = args.K;
-    limit = args.limit;
-    DIM = (int)args.cols.size();
-  }
-
+  int K = 0; long long limit = -1; int DIM = 0;
+  if (rank == 0) { K = args.K; limit = args.limit; DIM = (int)args.cols.size(); }
   MPI_Bcast(&K, 1, MPI_INT, 0, MPI_COMM_WORLD);
   MPI_Bcast(&limit, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
   MPI_Bcast(&DIM, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -550,14 +494,14 @@ int main(int argc, char** argv) {
   if (rank == 0) cols = args.cols;
   if (DIM > 0) MPI_Bcast(cols.data(), DIM, MPI_INT, 0, MPI_COMM_WORLD);
 
-  // Debug banner
+  // Debug banner (optional)
   if (rank == 0) {
     std::cerr << "K=" << K << " | DIM=" << DIM << " | cols:";
     for (int c : cols) std::cerr << ' ' << c;
     std::cerr << " | limit=" << limit << "\n";
   }
 
-  // Choose variant (interactive on rank 0)
+  // Choose variant interactively on rank 0
   int choice = 1;
   if (rank == 0) {
     cout << "Choose k-means variant:\n"
@@ -571,26 +515,19 @@ int main(int argc, char** argv) {
   }
   MPI_Bcast(&choice, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-  // ---------------- Read file on rank 0 ----------------
+  // ---------------- Read file on rank 0 (timed) ----------------
   vector<double> allP;
   long long N = 0;
-
   double t_io = 0.0;
+
+  double t0_io = MPI_Wtime();
   if (rank == 0) {
-    auto t0 = clk::now();
     try {
       fs::path fpath = fs::path(__FILE__).parent_path().parent_path() / "household_power_consumption.txt";
       std::ifstream ifs(fpath);
-      if (!ifs) {
-        std::cerr << "Cannot open file: " << fpath << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-      }
+      if (!ifs) { std::cerr << "Cannot open file: " << fpath << "\n"; MPI_Abort(MPI_COMM_WORLD, 1); }
 
-      string line;
-      if (!std::getline(ifs, line)) {
-        std::cerr << "Empty file\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-      }
+      string line; if (!std::getline(ifs, line)) { std::cerr << "Empty file\n"; MPI_Abort(MPI_COMM_WORLD, 1); }
 
       auto oknum = [](std::string s) -> bool {
         trim_inplace(s);
@@ -607,14 +544,10 @@ int main(int argc, char** argv) {
 
         vector<string> tok;
         tok.reserve(10);
-
         size_t start = 0;
         while (true) {
           size_t pos = line.find(';', start);
-          if (pos == string::npos) {
-            tok.emplace_back(line.substr(start));
-            break;
-          }
+          if (pos == string::npos) { tok.emplace_back(line.substr(start)); break; }
           tok.emplace_back(line.substr(start, pos - start));
           start = pos + 1;
         }
@@ -623,22 +556,15 @@ int main(int argc, char** argv) {
 
         bool good = true;
         for (int id : cols) {
-          if (id >= (int)tok.size()) {
-            good = false;
-            break;
-          }
+          if (id >= (int)tok.size()) { good = false; break; }
           trim_inplace(tok[id]);
-          if (!oknum(tok[id])) {
-            good = false;
-            break;
-          }
+          if (!oknum(tok[id])) { good = false; break; }
         }
         if (!good) continue;
 
         for (int id : cols) allP.push_back(std::stod(tok[id]));
         ++N;
       }
-
       ifs.close();
 
       if (N < K) {
@@ -649,36 +575,29 @@ int main(int argc, char** argv) {
       std::cerr << "Read error: " << e.what() << "\n";
       MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    auto t1 = clk::now();
-    t_io = secd(t1 - t0).count();
   }
+  double t1_io = MPI_Wtime();
+  t_io = t1_io - t0_io;
 
   // Broadcast N to all
   long long N64 = N;
   MPI_Bcast(&N64, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
   N = N64;
-  if (N == 0) {
-    MPI_Finalize();
-    return 0;
-  }
+  if (N == 0) { MPI_Finalize(); return 0; }
 
-  // Partition and scatter
+  // Partition and counts
   vector<long long> counts(size), displs(size);
   long long base = N / size, rem = N % size, off = 0;
-  for (int r = 0; r < size; ++r) {
-    counts[r] = base + (r < rem ? 1 : 0);
-    displs[r] = off;
-    off += counts[r];
-  }
+  for (int r = 0; r < size; ++r) { counts[r] = base + (r < rem ? 1 : 0); displs[r] = off; off += counts[r]; }
 
   int nloc = (int)counts[rank];
-
   vector<int> sc_counts(size), sc_displs(size);
   for (int r = 0; r < size; ++r) {
-    sc_counts[r]  = (int)(counts[r] * DIM);
-    sc_displs[r]  = (int)(displs[r] * DIM);
+    sc_counts[r] = (int)(counts[r] * DIM);
+    sc_displs[r] = (int)(displs[r] * DIM);
   }
 
+  // Scatter to ranks (not timed for the simplified report)
   vector<double> P((size_t)nloc * DIM);
   MPI_Scatterv(rank == 0 ? allP.data() : nullptr,
                sc_counts.data(),
@@ -692,7 +611,6 @@ int main(int argc, char** argv) {
 
   // Initialize centroids on rank 0 (sample K unique points)
   vector<double> C((size_t)K * DIM), prevC((size_t)K * DIM);
-
   if (rank == 0) {
     std::mt19937 gen(2025);
     vector<long long> idx(N);
@@ -703,7 +621,6 @@ int main(int argc, char** argv) {
       for (int d = 0; d < DIM; ++d) C[i * (size_t)DIM + d] = allP[id * (size_t)DIM + d];
     }
   }
-
   MPI_Bcast(C.data(), K * DIM, MPI_DOUBLE, 0, MPI_COMM_WORLD);
   prevC = C;
 
@@ -716,26 +633,30 @@ int main(int argc, char** argv) {
   vector<double> upper(nloc, std::numeric_limits<double>::infinity());
   vector<double> lower(nloc, 0.0);
   vector<double> cMove(K, 0.0), sK(K, 0.0);
-  vector<double> Dcc, lowerMat, lowerG;
+  vector<double> Dcc;
+  vector<double> lowerMat;      // nloc x K
+  vector<double> lowerG;        // nloc x G
   int            G = std::max(1, std::min(K, 10));
   vector<int>    gid(K, 0);
 
   if (choice == 2) lowerMat.assign((size_t)nloc * K, 0.0);
   if (choice == 4) lowerG.assign((size_t)nloc * G, 0.0);
 
-  MPI_Barrier(MPI_COMM_WORLD);
-  double t_scatter = -MPI_Wtime();
-  double t0 = MPI_Wtime();
-
+  // ---------------- Compute region (timed total only) ----------------
   const int    max_iter  = 100;
   const double tol       = 1e-4;
   int          it        = 0;
   double       max_shift = 0.0;
 
+  double t_compute = 0.0;
+  MPI_Barrier(MPI_COMM_WORLD);
+  double t0_comp = MPI_Wtime();
+
   for (it = 0; it < max_iter; ++it) {
     std::fill(sum.begin(), sum.end(), 0.0);
     std::fill(cnt.begin(), cnt.end(), 0);
 
+    // Precompute on rank 0
     if (rank == 0) {
       for (int c = 0; c < K; ++c) {
         double sh = 0.0;
@@ -749,7 +670,6 @@ int main(int argc, char** argv) {
       if (choice == 2 || choice == 4) compute_center_dists(C, K, Dcc);
       if (choice == 4) kmeans_group_centroids(C, K, G, gid);
     }
-
     if (choice == 3 && rank != 0) sK.resize(K);
     if ((choice == 2 || choice == 4) && rank != 0) Dcc.resize((size_t)K * (size_t)K);
     if (choice == 4 && rank != 0) gid.resize(K);
@@ -759,31 +679,24 @@ int main(int argc, char** argv) {
     if (choice == 2 || choice == 4) MPI_Bcast(Dcc.data(), K * K, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (choice == 4) MPI_Bcast(gid.data(), K, MPI_INT, 0, MPI_COMM_WORLD);
 
+    // Assign
     switch (choice) {
-      case 1:
-        assign_lloyd(P, C, K, label, sum, cnt);
-        break;
-      case 2:
-        assign_elkan(P, C, prevC, cMove, Dcc, K, label, upper, lowerMat, sum, cnt);
-        break;
-      case 3:
-        assign_hamerly(P, C, prevC, sK, cMove, K, label, upper, lower, sum, cnt);
-        break;
-      case 4:
-        assign_yinyang(P, C, prevC, gid, G, cMove, Dcc, K, label, upper, lowerG, sum, cnt);
-        break;
+      case 1: assign_lloyd(P, C, K, label, sum, cnt); break;
+      case 2: assign_elkan(P, C, prevC, cMove, Dcc, K, label, upper, lowerMat, sum, cnt); break;
+      case 3: assign_hamerly(P, C, prevC, sK, cMove, K, label, upper, lower, sum, cnt); break;
+      case 4: assign_yinyang(P, C, prevC, gid, G, cMove, Dcc, K, label, upper, lowerG, sum, cnt); break;
     }
 
+    // Reduce
     MPI_Allreduce(sum.data(), gsum.data(), K * DIM, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(cnt.data(), gcnt.data(), K, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
+    // Update on rank 0
     if (rank == 0) {
       prevC = C;
       max_shift = 0.0;
-
       for (int c = 0; c < K; ++c) {
         double sh = 0.0;
-
         if (gcnt[c] > 0) {
           for (int d = 0; d < DIM; ++d) {
             double oldv = C[c * (size_t)DIM + d];
@@ -792,12 +705,8 @@ int main(int argc, char** argv) {
             sh += dx * dx;
           }
         } else {
-          for (int d = 0; d < DIM; ++d) {
-            double dx = 0.0;
-            sh += dx * dx;
-          }
+          for (int d = 0; d < DIM; ++d) { double dx = 0.0; sh += dx * dx; }
         }
-
         double mv = std::sqrt(sh);
         if (mv > max_shift) max_shift = mv;
       }
@@ -809,65 +718,51 @@ int main(int argc, char** argv) {
     if (max_shift < tol) break;
   }
 
-  double t1 = MPI_Wtime();
+  MPI_Barrier(MPI_COMM_WORLD);
+  double t1_comp = MPI_Wtime();
+  t_compute = t1_comp - t0_comp;
 
+  // Gather labels (not timed for the simplified report)
+  vector<int> counts_lbl(size), displs_lbl(size);
+  for (int r = 0; r < size; ++r) { counts_lbl[r] = (int)counts[r]; displs_lbl[r] = (int)displs[r]; }
+  vector<int> allLab;
+  if (rank == 0) allLab.resize((size_t)N);
+  MPI_Gatherv(label.data(), nloc, MPI_INT,
+              rank == 0 ? allLab.data() : nullptr, counts_lbl.data(), displs_lbl.data(), MPI_INT,
+              0, MPI_COMM_WORLD);
+
+  // ---------------- Report (just like serial) ----------------
   if (rank == 0) {
     cout << "--------------------------------------------------------------------------\n";
     cout << "Converged after " << (it + 1) << " iteration(s)\n";
     cout << "Variant: " << (choice == 1 ? "Lloyd" : choice == 2 ? "Elkan" : choice == 3 ? "Hamerly" : "Yinyang") << "\n";
-    cout << "Time (s): " << (t1 - t0) << "\n";
     cout << "MPI ranks: " << size << "\n";
     cout << "Rows used (N): " << N << " | Features (DIM): " << DIM << " | K: " << K << "\n";
+    cout << "I/O time (s): "     << t_io      << "\n";
+    cout << "Compute time (s): " << t_compute << "\n";
+    cout << "Total time (s): "   << (t_io + t_compute) << "\n";
   }
 
-  // Gather labels to rank 0 for output
-  vector<int> counts_lbl(size), displs_lbl(size);
-  for (int r = 0; r < size; ++r) {
-    counts_lbl[r] = (int)counts[r];
-    displs_lbl[r] = (int)displs[r];
-  }
-
-  vector<int> allLab;
-  if (rank == 0) allLab.resize((size_t)N);
-
-  MPI_Gatherv(label.data(),
-              nloc,
-              MPI_INT,
-              rank == 0 ? allLab.data() : nullptr,
-              counts_lbl.data(),
-              displs_lbl.data(),
-              MPI_INT,
-              0,
-              MPI_COMM_WORLD);
-
+  // ---------------- Write output (rank 0) ----------------
   if (rank == 0) {
     fs::path out = fs::current_path() / "clustering_result.txt";
     std::ofstream ofs(out);
     ofs << std::fixed << std::setprecision(3);
-
     for (int c = 0; c < K; ++c) {
       ofs << "Cluster " << (c + 1) << " : (";
-      for (int d = 0; d < DIM; ++d) {
-        if (d) ofs << ", ";
-        ofs << C[c * (size_t)DIM + d];
-      }
+      for (int d = 0; d < DIM; ++d) { if (d) ofs << ", "; ofs << C[c * (size_t)DIM + d]; }
       ofs << ") --> ";
-
       bool first = true;
       for (long long i = 0; i < N; ++i) {
         if (allLab[(size_t)i] != c) continue;
         if (!first) ofs << ", ";
         first = false;
         ofs << "(";
-        for (int d = 0; d < DIM; ++d) {
-          if (d) ofs << ", ";
-          ofs << allP[(size_t)i * (size_t)DIM + d];
-        }
+        for (int d = 0; d < DIM; ++d) { if (d) ofs << ", "; ofs << allP[(size_t)i * (size_t)DIM + d]; }
         ofs << ")";
       }
       ofs << "\n";
     }
-
     ofs.close();
     cout << "Wrote " << out << "\n";
   }
