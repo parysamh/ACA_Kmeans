@@ -1,32 +1,3 @@
-// MPI K-Means Variants: Lloyd, Elkan, Hamerly, Yinyang (file-driven, dimension-agnostic)
-// Reads points from a semicolon-separated file "household_power_consumption.txt"
-// placed in the PARENT directory of this source file. Uses ANY number of chosen columns as features.
-// The program ALWAYS asks the user which variant to run; K and columns come from CLI.
-//
-// ---------------------------------------------------------------
-// Build:
-//   mpic++ -std=gnu++17 -O3 -march=native -o kmeans_variants kmeans_variants.cpp
-//
-// Run examples:
-//   mpirun -np 4  ./kmeans_variants --k=5 --cols=GAP,V --limit=200000
-//   mpirun -np 8  ./kmeans_variants --k=6 --cols=GI,SM1,SM2
-//   mpirun -np 14 ./kmeans_variants --k=6 --cols=GAP,GRP,V,GI,SM1,SM2,SM3 --limit=100000
-//
-// Args:
-//   --k=<int>            number of clusters (required; >0)
-//   --cols=C1[,C2,...]   one or more columns as features (default: GAP,GRP,V,GI,SM1,SM2,SM3)
-//                        from {GAP,GRP,V,GI,SM1,SM2,SM3}
-//   --limit=<int>        cap maximum rows loaded (optional)
-//
-// Notes:
-// - Dimension (DIM) is determined at runtime from the number of columns in --cols.
-// - If --cols is omitted, defaults to all 7 features.
-// - Rank 0 reads the file, parses selected columns, skips rows with missing values ('?'), then Scatterv's.
-// - File path: parent_path(__FILE__) / "household_power_consumption.txt".
-// - Output: clustering_result.txt in current working directory on rank 0.
-// - This version reports only I/O, Compute, and Total times (I/O + Compute).
-// ---------------------------------------------------------------
-
 #include <mpi.h>
 
 #include <algorithm>
@@ -51,8 +22,7 @@ using std::vector;
 
 namespace fs = std::filesystem;
 
-// -------------------------- Utilities --------------------------
-
+// string trimming helper for input parsing
 static inline void trim_inplace(std::string& s) {
   size_t a = s.find_first_not_of(" \t\r");
   if (a == std::string::npos) { s.clear(); return; }
@@ -60,11 +30,10 @@ static inline void trim_inplace(std::string& s) {
   s = s.substr(a, b - a + 1);
 }
 
-// Global runtime dimension (set after parsing --cols)
+// global dimension (set from CLI args, e.g. --cols)
 static int gDIM = 2;
 
-// -------------------------- Math --------------------------
-
+//math
 inline double sqdist2(const double* p, const double* c) {
   double s = 0.0;
   for (int d = 0; d < gDIM; ++d) {
@@ -78,8 +47,7 @@ inline double l2(const double* a, const double* b) {
   return std::sqrt(sqdist2(a, b));
 }
 
-// --------------- Center Separation (Elkan / Hamerly) ---------------
-
+// for Hamerly/Elkan pruning
 static void compute_center_separation(const vector<double>& C, int K, vector<double>& s) {
   s.assign(K, std::numeric_limits<double>::infinity());
   for (int c = 0; c < K; ++c) {
@@ -103,8 +71,7 @@ static void compute_center_dists(const vector<double>& C, int K, vector<double>&
   }
 }
 
-// -------------------------- Lloyd --------------------------
-
+//Lloyd
 static void assign_lloyd(const vector<double>& P,
                          const vector<double>& C,
                          int K,
@@ -133,8 +100,7 @@ static void assign_lloyd(const vector<double>& P,
   }
 }
 
-// -------------------------- Hamerly --------------------------
-
+//hamerly
 static void assign_hamerly(const vector<double>& P,
                            const vector<double>& C,
                            const vector<double>& /*prevC*/,
@@ -197,8 +163,7 @@ static void assign_hamerly(const vector<double>& P,
   }
 }
 
-// -------------------------- Elkan --------------------------
-
+//elkan
 static void assign_elkan(const vector<double>& P,
                          const vector<double>& C,
                          const vector<double>& /*prevC*/,
@@ -281,8 +246,7 @@ static void assign_elkan(const vector<double>& P,
   }
 }
 
-// -------------------------- Yinyang helpers --------------------------
-
+//yinhyang
 static void kmeans_group_centroids(const vector<double>& C, int K, int G, vector<int>& gid) {
   G = std::max(1, std::min(G, K));
   gid.assign(K, 0);
@@ -398,11 +362,11 @@ static void assign_yinyang(const vector<double>& P,
   }
 }
 
-// ---------------------- Arg parsing ----------------------
+// parse CLI args (--k, --limit, --cols)
 struct Parsed {
-  int         K            = 5;   // default K=5
-  long long   limit        = -1;  // optional
-  vector<int> cols;               // column indices (in file)
+  int         K            = 5;
+  long long   limit        = -1;
+  vector<int> cols;
   bool        colsSpecified = false;
 };
 
@@ -447,7 +411,6 @@ static Parsed parse_args(int argc, char** argv) {
     }
   }
 
-  // Default to all 7 features if --cols not provided
   if (!a.colsSpecified) {
     a.cols = {2, 3, 4, 5, 6, 7, 8};
     a.colsSpecified = true;
@@ -456,7 +419,7 @@ static Parsed parse_args(int argc, char** argv) {
   return a;
 }
 
-// ----------------------------- Main -----------------------------
+//main
 int main(int argc, char** argv) {
   MPI_Init(&argc, &argv);
   int rank = 0, size = 1;
@@ -473,7 +436,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Broadcast simple scalars first
+  //broadcast simple scalars first
   int K = 0; long long limit = -1; int DIM = 0;
   if (rank == 0) { K = args.K; limit = args.limit; DIM = (int)args.cols.size(); }
   MPI_Bcast(&K, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -481,7 +444,7 @@ int main(int argc, char** argv) {
   MPI_Bcast(&DIM, 1, MPI_INT, 0, MPI_COMM_WORLD);
   gDIM = DIM;
 
-  // Guard: must have at least one feature
+  //must have at least one feature
   if (rank == 0 && DIM == 0) {
     std::cerr << "No features selected (DIM=0). Use --cols from {GAP,GRP,V,GI,SM1,SM2,SM3}.\n";
   }
@@ -489,19 +452,17 @@ int main(int argc, char** argv) {
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
 
-  // Broadcast column indices
+  //broadcast column indices
   vector<int> cols(DIM);
   if (rank == 0) cols = args.cols;
   if (DIM > 0) MPI_Bcast(cols.data(), DIM, MPI_INT, 0, MPI_COMM_WORLD);
 
-  // Debug banner (optional)
   if (rank == 0) {
     std::cerr << "K=" << K << " | DIM=" << DIM << " | cols:";
     for (int c : cols) std::cerr << ' ' << c;
     std::cerr << " | limit=" << limit << "\n";
   }
 
-  // Choose variant interactively on rank 0
   int choice = 1;
   if (rank == 0) {
     cout << "Choose k-means variant:\n"
@@ -515,7 +476,7 @@ int main(int argc, char** argv) {
   }
   MPI_Bcast(&choice, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-  // ---------------- Read file on rank 0 (timed) ----------------
+  //read file on rank 0
   vector<double> allP;
   long long N = 0;
   double t_io = 0.0;
@@ -579,13 +540,13 @@ int main(int argc, char** argv) {
   double t1_io = MPI_Wtime();
   t_io = t1_io - t0_io;
 
-  // Broadcast N to all
+  //broadcast N to all
   long long N64 = N;
   MPI_Bcast(&N64, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
   N = N64;
   if (N == 0) { MPI_Finalize(); return 0; }
 
-  // Partition and counts
+  //partition and counts
   vector<long long> counts(size), displs(size);
   long long base = N / size, rem = N % size, off = 0;
   for (int r = 0; r < size; ++r) { counts[r] = base + (r < rem ? 1 : 0); displs[r] = off; off += counts[r]; }
@@ -597,7 +558,7 @@ int main(int argc, char** argv) {
     sc_displs[r] = (int)(displs[r] * DIM);
   }
 
-  // Scatter to ranks (not timed for the simplified report)
+  //scatter to ranks
   vector<double> P((size_t)nloc * DIM);
   MPI_Scatterv(rank == 0 ? allP.data() : nullptr,
                sc_counts.data(),
@@ -609,7 +570,7 @@ int main(int argc, char** argv) {
                0,
                MPI_COMM_WORLD);
 
-  // Initialize centroids on rank 0 (sample K unique points)
+  //initialize centroids on rank 0
   vector<double> C((size_t)K * DIM), prevC((size_t)K * DIM);
   if (rank == 0) {
     std::mt19937 gen(2025);
@@ -624,25 +585,24 @@ int main(int argc, char** argv) {
   MPI_Bcast(C.data(), K * DIM, MPI_DOUBLE, 0, MPI_COMM_WORLD);
   prevC = C;
 
-  // Common buffers
+  //cmmon buffers
   vector<int>    label(nloc, -1);
   vector<double> sum((size_t)K * DIM, 0.0), gsum((size_t)K * DIM, 0.0);
   vector<int>    cnt(K, 0), gcnt(K, 0);
 
-  // Variant-specific state
+  //variant-specific state
   vector<double> upper(nloc, std::numeric_limits<double>::infinity());
   vector<double> lower(nloc, 0.0);
   vector<double> cMove(K, 0.0), sK(K, 0.0);
   vector<double> Dcc;
-  vector<double> lowerMat;      // nloc x K
-  vector<double> lowerG;        // nloc x G
+  vector<double> lowerMat;
+  vector<double> lowerG;
   int            G = std::max(1, std::min(K, 10));
   vector<int>    gid(K, 0);
 
   if (choice == 2) lowerMat.assign((size_t)nloc * K, 0.0);
   if (choice == 4) lowerG.assign((size_t)nloc * G, 0.0);
 
-  // ---------------- Compute region (timed total only) ----------------
   const int    max_iter  = 100;
   const double tol       = 1e-4;
   int          it        = 0;
@@ -656,7 +616,6 @@ int main(int argc, char** argv) {
     std::fill(sum.begin(), sum.end(), 0.0);
     std::fill(cnt.begin(), cnt.end(), 0);
 
-    // Precompute on rank 0
     if (rank == 0) {
       for (int c = 0; c < K; ++c) {
         double sh = 0.0;
@@ -679,7 +638,7 @@ int main(int argc, char** argv) {
     if (choice == 2 || choice == 4) MPI_Bcast(Dcc.data(), K * K, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (choice == 4) MPI_Bcast(gid.data(), K, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // Assign
+    //assign
     switch (choice) {
       case 1: assign_lloyd(P, C, K, label, sum, cnt); break;
       case 2: assign_elkan(P, C, prevC, cMove, Dcc, K, label, upper, lowerMat, sum, cnt); break;
@@ -687,11 +646,11 @@ int main(int argc, char** argv) {
       case 4: assign_yinyang(P, C, prevC, gid, G, cMove, Dcc, K, label, upper, lowerG, sum, cnt); break;
     }
 
-    // Reduce
+    //reduce
     MPI_Allreduce(sum.data(), gsum.data(), K * DIM, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(cnt.data(), gcnt.data(), K, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
-    // Update on rank 0
+    //update on rank 0
     if (rank == 0) {
       prevC = C;
       max_shift = 0.0;
@@ -722,7 +681,7 @@ int main(int argc, char** argv) {
   double t1_comp = MPI_Wtime();
   t_compute = t1_comp - t0_comp;
 
-  // Gather labels (not timed for the simplified report)
+  //gather labels
   vector<int> counts_lbl(size), displs_lbl(size);
   for (int r = 0; r < size; ++r) { counts_lbl[r] = (int)counts[r]; displs_lbl[r] = (int)displs[r]; }
   vector<int> allLab;
@@ -731,7 +690,7 @@ int main(int argc, char** argv) {
               rank == 0 ? allLab.data() : nullptr, counts_lbl.data(), displs_lbl.data(), MPI_INT,
               0, MPI_COMM_WORLD);
 
-  // ---------------- Report (just like serial) ----------------
+  //report
   if (rank == 0) {
     cout << "--------------------------------------------------------------------------\n";
     cout << "Converged after " << (it + 1) << " iteration(s)\n";
@@ -743,7 +702,7 @@ int main(int argc, char** argv) {
     cout << "Total time (s): "   << (t_io + t_compute) << "\n";
   }
 
-  // ---------------- Write output (rank 0) ----------------
+  //output
   if (rank == 0) {
     fs::path out = fs::current_path() / "clustering_result.txt";
     std::ofstream ofs(out);
